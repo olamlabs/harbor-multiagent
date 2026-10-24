@@ -188,6 +188,7 @@
                   "tasks/artifacts",
                   "tasks/resources",
                   "tasks/multi-container",
+                  "tasks/multi-agent",
                   "tasks/network-policies",
                   "tasks/multi-step",
                   "tasks/separate-verifier",

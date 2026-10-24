@@ -1,0 +1,269 @@
+---
+title: "Multi-agent"
+description: "Run several agents in one environment."
+---
+
+A multi-agent task puts several agents in one environment at once. Use it to build any multi-agent simulation:
+
+- **Games**: players who compete, negotiate or cooperate in one shared world.
+- **Multi-agent enterprises**: a company of agents, where the agent under test works with coworkers, managers or customers played by other agents.
+- **Competition**: two models head to head on the same task, or an attacker against a defender.
+- **Self-play**: one model in every role.
+
+Each agent runs in its own container, with its own harness, model, instruction and logs. Any harness and model that Harbor supports can fill any role, either as an agent under test or as a supporting agent. The verifier grades the whole environment once, at the end.
+
+## How it fits together
+
+- The task's `environment/docker-compose.yaml` holds the environment's services plus one service per agent.
+- `task.toml` names each agent's service in an `[agents.<service>]` table.
+- Each agent reads its own `instructions/<service>.md`.
+- A trial or job config fills each agent's service with a participant: an ordinary Harbor agent config plus `seat`, the service it runs in.
+
+The service an agent runs in is its **seat**. The word appears in `participants[].seat`, in `seat_results` and in log prefixes. `main` is never a seat: the verifier runs there.
+
+## Example
+
+[`examples/tasks/hello-seats`](https://github.com/olamlabs/harbor-multiagent/tree/main/examples/tasks/hello-seats) is the smallest multi-agent task. Its world is an HTTP notes server in `main`. Agent `p1` posts a note, checks that it is there, and stops. Agent `p2` posts a note, then polls until p1's note appears.
+
+```bash
+hello-seats/
+├── task.toml
+├── instructions/
+│   ├── p1.md                   # p1's instruction
+│   └── p2.md                   # p2's instruction
+├── environment/
+│   ├── Dockerfile              # main: the shared world, and the verifier
+│   ├── docker-compose.yaml     # main plus one service per agent
+│   ├── world.py
+│   └── player/
+│       └── Dockerfile          # the image both agents run in
+└── tests/
+    └── test.sh
+```
+
+## task.toml
+
+Name each agent's service with an `[agents.<service>]` table:
+
+```toml title="task.toml"
+artifacts = ["/logs/world/notes.jsonl"]
+
+[agent]
+timeout_sec = 600.0
+
+[verifier]
+timeout_sec = 120.0
+
+[agents.p1]
+
+[agents.p2]
+under_test = false
+```
+
+Each `[agents.<service>]` table takes two optional keys:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `under_test` | `true` | The run lasts until every agent under test has ended. Agents with `under_test = false` are supporting agents: they never hold the run open, and Harbor cancels them when it ends. Scoring is unaffected. |
+| `mcp_servers` | `[]` | MCP servers for this agent, added to `[environment] mcp_servers`. A participant's own `mcp_servers` are added last. A server replaces an earlier one with the same name. |
+
+At least one agent must be under test. In the example, p1 is under test and p2 supports it, so the run ends when p1 ends.
+
+`[agent] timeout_sec` is one agent timeout shared by every agent. Trial and job timeout multipliers apply to it as usual. Without it, the run lasts until every agent under test has ended.
+
+The order of the tables is the agents' order. `agent_info` in `result.json` is the first agent under test, and the trial's error is the first agent error in this order.
+
+## Instructions
+
+A multi-agent task has no `instruction.md`. Every agent needs `instructions/<service>.md`. Extra instructions from the trial or job config are appended to each one.
+
+```markdown title="instructions/p1.md"
+You are p1. Post exactly one note to http://world:8080/note with author p1 and the text 'hello from p1', then GET /notes and confirm it is there, then stop.
+```
+
+## The Compose file
+
+`environment/docker-compose.yaml` holds the environment's services plus one service per agent. Harbor merges it on top of its base compose file, as for any [multi-container](https://harborframework.com/docs/tasks/multi-container) task.
+
+```yaml title="environment/docker-compose.yaml"
+x-player: &player
+  build: ./player
+  user: player
+  working_dir: /home/player
+  command: ["sleep", "infinity"]
+  init: true
+  networks: [play]
+  depends_on:
+    main:
+      condition: service_healthy
+
+services:
+  main:
+    command: ["python3", "/world/world.py"]
+    networks:
+      play:
+        aliases: [world]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=2)"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 2s
+  p1: *player
+  p2: *player
+
+networks:
+  play: {}
+```
+
+Both agents run the same image as the user `player`, wait for `main` to be healthy, and reach the world as `world`.
+
+### An agent's container
+
+- It keeps running: Harbor runs the agent inside it with `docker compose exec`. Use `command: ["sleep", "infinity"]` or a long-running process of its own.
+- It has `bash`: Harbor runs every agent command with `bash -c`.
+- It has whatever the harness's install needs, as `main` would in a single-agent task. The example's player image installs `curl`, `git` and Node.js.
+
+The agent's user and working directory are the service's Compose `user:` and `working_dir:`. Harbor passes no `-u` for ordinary commands, so the agent runs with that user's uid and gid; install steps that ask for root run with `-u root`. At setup, Harbor reads the uid with `id -u` and uses it for the harness's file-ownership fixes. Set `user:` on each service rather than `[agent] user`.
+
+The container's image, environment variables, volumes and networks come from Compose; `main`'s `[environment]` settings do not apply to it. If the task sets `[environment] skills_dir`, every agent receives that path, so put the skills at that path in each agent's container.
+
+Harbor creates `/logs/agent` in each agent's container. The harness writes its logs there, and Harbor copies them out after the run.
+
+### Sharing an agent's files with the verifier
+
+The verifier runs in `main`. To let it read files from an agent's container, share a named volume:
+
+```yaml title="environment/docker-compose.yaml"
+services:
+  main:
+    volumes: ["p1-home:/agents/p1/home:ro"]
+  p1:
+    <<: *player # the shared x-player fields above
+    volumes: ["p1-home:/home/player"]
+
+volumes:
+  p1-home: {}
+```
+
+`tests/test.sh` can then read p1's home directory at `/agents/p1/home`.
+
+## Participants
+
+A trial config fills each agent's service with a participant. A participant is an ordinary Harbor agent config, with the same fields as [`agents[]`](https://harborframework.com/docs/jobs/configs#agents) in a job config, plus `seat`.
+
+```yaml title="trial config"
+task:
+  path: examples/tasks/hello-seats
+environment:
+  type: docker
+participants:
+  - seat: p1
+    name: codex
+    model_name: openai/gpt-5.5
+  - seat: p2
+    name: codex
+    model_name: openai/gpt-5.5
+```
+
+Run the example's trial config, [`examples/configs/features/seats-trial.yaml`](https://github.com/olamlabs/harbor-multiagent/blob/main/examples/configs/features/seats-trial.yaml), from the repository root with Docker running and `OPENAI_API_KEY` set:
+
+```bash
+harbor trial start -c examples/configs/features/seats-trial.yaml
+```
+
+Harbor prints each participant and marks the agents under test:
+
+```
+Participants:
+  p1: codex openai/gpt-5.5 (under test)
+  p2: codex openai/gpt-5.5
+```
+
+Participants can mix harnesses and models. This roster puts two models head to head:
+
+```yaml
+participants:
+  - seat: p1
+    name: codex
+    model_name: openai/gpt-5.5
+  - seat: p2
+    name: claude-code
+    model_name: anthropic/claude-opus-5-5
+```
+
+Every service in `task.toml` needs exactly one participant. Participants are matched to services by name, in any order. The task, not the config, says which agents are under test. A config with `participants` leaves out `agent`.
+
+### Jobs
+
+A job config takes the same `participants` list and uses it for every trial in the job, in place of `agents`. Every task in the job is then a multi-agent task with those services. `n_attempts`, `n_concurrent_trials`, datasets and the other job settings work as usual, and the job's lock file records the participants.
+
+```bash
+harbor run -c examples/configs/features/seats-job.yaml
+```
+
+## How a run works
+
+1. Harbor starts the Compose project and runs the task's healthcheck, as for any task.
+2. Harbor installs every agent into its container at the same time. Each install has its own agent setup timeout. If any install fails, the trial fails before any agent runs.
+3. All agents start together, each with its own instruction.
+4. The run ends when every agent under test has ended, or when the agent timeout runs out.
+5. Harbor cancels the agents still running, as it does for a single agent at its timeout. The containers stay up.
+6. Harbor copies each agent's `/logs/agent` to `seats/<service>/agent/` in the trial folder, and records its trajectory, token usage and cost as it does for a single agent. It does this for every agent, under test or not.
+7. Harbor collects the task's artifacts.
+8. When verification is enabled, Harbor copies the trial's `seats/` folder into `main` at `/logs/seats/`.
+9. The verifier runs once, in `main`, with every container still up.
+10. Harbor stops the project.
+
+### When an agent fails
+
+- An agent that exits non-zero, for example on a rejected API key, has ended. Harbor records the error on its seat, the other agents keep going, and the trial is still verified.
+- When the agent timeout runs out, every agent still running records `AgentTimeoutError`, and the trial is still verified.
+- Any other error from an agent's run, such as a bug in the harness code, cancels the other agents and fails the trial without verification, as it would a single-agent trial.
+
+The trial's `exception_info` is the first agent error in `[agents.<service>]` order, supporting agents included. Its message starts with the service name, for example `Seat 'p2': ...`.
+
+## The verifier
+
+The verifier runs once, in `main`, after the run ends and while every container is still up. It can query the environment's services, read volumes shared with `main`, and read each agent's logs and trajectory under `/logs/seats/<service>/agent/`.
+
+The example's `tests/test.sh` writes one reward. It checks that p1's note reached the world and that both agents left a trajectory:
+
+```python title="tests/test.sh (excerpt)"
+reward = int(p1_posted() and has_trajectory("p1") and has_trajectory("p2"))
+Path("/logs/verifier/reward.txt").write_text(f"{reward}\n")
+```
+
+`p1_posted()` reads `/logs/world/notes.jsonl` in `main`. `has_trajectory(seat)` checks that `/logs/seats/<seat>/agent/trajectory.json` is non-empty JSON.
+
+The verifier writes whatever rewards it likes, whether or not an agent is under test. To score agents separately, write one key per agent to `/logs/verifier/reward.json`:
+
+```json
+{"p1": 1, "p2": 0.5}
+```
+
+The job summary reports each key.
+
+## Logs and results
+
+- `seats/<service>/agent/`: the agent's logs, and its `trajectory.json` if the harness writes one.
+- `trial.log`: each line logged by an agent or its container starts with the service name, for example `[p1] Running command: ...`.
+- `result.json`:
+  - `config` has `participants` and no `agent`.
+  - `agent_info` is the first agent under test.
+  - `agent_setup` and `agent_execution` span all agents.
+  - Token and cost totals sum every agent.
+  - `seat_results` lists every agent with `seat`, `under_test`, `agent_info`, `agent_result` (tokens and cost), `agent_setup`, `agent_execution`, `exception_info` and `ended_by_play_end`.
+
+`ended_by_play_end` is `true` for an agent that was still running when the run ended, because every agent under test had ended or the agent timeout ran out.
+
+## Limitations
+
+- Multi-agent tasks need an environment that can exec in, upload to and download from any Compose service: `docker`, `podman`, and the cloud environments that run Compose (`modal`, `daytona`, `gke`, `ec2` and others). Harbor refuses the rest at launch, naming the environment.
+- On `modal`, use the VM runtime (`environment.kwargs: {modal_vm_runtime: true}`). Modal's default sandbox puts every Compose service on host networking, which fails any task that declares `networks:`.
+- The verifier runs in `main`; separate verifiers are not supported.
+- Network mode must be `public`.
+- Simulated users (`user_agent`) are not supported.
+- A multi-agent task cannot have `[[steps]]`.
+- Multi-agent trials cannot be regraded.
+- Participants cannot set `override_timeout_sec`, `max_timeout_sec`, `n_concurrent`, `concurrency_group`, `skills`, `load_trajectory` or `extra_allowed_hosts`.
