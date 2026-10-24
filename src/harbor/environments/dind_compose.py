@@ -121,13 +121,21 @@ class DinDComposeOps:
 
         return await self._compose_exec(parts, timeout_sec=timeout_sec)
 
-    async def upload_file(self, source_path: Path | str, target_path: str) -> None:
-        """Two-hop upload: stage to host temp, ``docker compose cp`` → main."""
+    async def upload_file(
+        self,
+        source_path: Path | str,
+        target_path: str,
+        *,
+        service: str | None = None,
+    ) -> None:
+        """Two-hop upload: stage to host temp, ``docker compose cp`` into a
+        compose container (default: main)."""
+        service = service or MAIN_SERVICE_NAME
         temp = f"/tmp/harbor_{uuid4().hex}"
         try:
             await self._stage_file_to_host(source_path, temp)
             result = await self._compose_exec(
-                ["cp", temp, f"{MAIN_SERVICE_NAME}:{target_path}"],
+                ["cp", temp, f"{service}:{target_path}"],
                 timeout_sec=self._CP_FILE_TIMEOUT_SEC,
             )
             if result.return_code != 0:
@@ -137,13 +145,21 @@ class DinDComposeOps:
         finally:
             await self._host_exec(f"rm -f {shlex.quote(temp)}", timeout_sec=10)
 
-    async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
-        """Two-hop upload: stage to host temp dir, ``docker compose cp`` → main."""
+    async def upload_dir(
+        self,
+        source_dir: Path | str,
+        target_dir: str,
+        *,
+        service: str | None = None,
+    ) -> None:
+        """Two-hop upload: stage to host temp dir, ``docker compose cp`` into a
+        compose container (default: main)."""
+        service = service or MAIN_SERVICE_NAME
         temp = f"/tmp/harbor_{uuid4().hex}"
         try:
             await self._stage_dir_to_host(source_dir, temp)
             result = await self._compose_exec(
-                ["cp", f"{temp}/.", f"{MAIN_SERVICE_NAME}:{target_dir}"],
+                ["cp", f"{temp}/.", f"{service}:{target_dir}"],
                 timeout_sec=self._CP_DIR_TIMEOUT_SEC,
             )
             if result.return_code != 0:
@@ -277,6 +293,24 @@ class DinDComposeOps:
             user=user,
             service=service,
         )
+
+    async def service_upload_file(
+        self,
+        source_path: Path | str,
+        target_path: str,
+        *,
+        service: str | None = None,
+    ) -> None:
+        await self.upload_file(source_path, target_path, service=service)
+
+    async def service_upload_dir(
+        self,
+        source_dir: Path | str,
+        target_dir: str,
+        *,
+        service: str | None = None,
+    ) -> None:
+        await self.upload_dir(source_dir, target_dir, service=service)
 
     async def service_download_file(
         self,

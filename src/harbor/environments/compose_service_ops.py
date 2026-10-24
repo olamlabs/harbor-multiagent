@@ -1,9 +1,10 @@
 """Shared per-service compose operations for DinD-based environments.
 
 Modal, Daytona, and GKE all run docker-compose tasks inside a DinD
-sandbox/pod and expose the same per-service surface (exec / download /
-stop on individual compose services) for sidecar artifact collection and
-verifier collect hooks. The env-level dispatch is identical across
+sandbox/pod and expose the same per-service surface (exec / upload /
+download / stop on individual compose services) for sidecar artifact
+collection, verifier collect hooks, and agents running in their own
+services. The env-level dispatch is identical across
 providers: operations targeting the main service delegate to the
 environment's regular methods (which apply main-specific defaults such
 as workdir, default user, and persistent env), while sidecar-targeted
@@ -43,6 +44,22 @@ class ComposeServiceTransport(Protocol):
         timeout_sec: int | None = None,
         user: str | int | None = None,
     ) -> ExecResult: ...
+
+    async def service_upload_file(
+        self,
+        source_path: Path | str,
+        target_path: str,
+        *,
+        service: str,
+    ) -> None: ...
+
+    async def service_upload_dir(
+        self,
+        source_dir: Path | str,
+        target_dir: str,
+        *,
+        service: str,
+    ) -> None: ...
 
     async def service_download_file(
         self,
@@ -113,6 +130,34 @@ class ComposeServiceOpsMixin(_Base):
             timeout_sec=timeout_sec,
             user=user,
         )
+
+    @override
+    async def service_upload_file(
+        self,
+        source_path: Path | str,
+        target_path: str,
+        *,
+        service: str | None = None,
+    ) -> None:
+        if service is None or self.is_main_service(service):
+            await self.upload_file(source_path, target_path)
+            return
+        transport = self._compose_service_transport(service)
+        await transport.service_upload_file(source_path, target_path, service=service)
+
+    @override
+    async def service_upload_dir(
+        self,
+        source_dir: Path | str,
+        target_dir: str,
+        *,
+        service: str | None = None,
+    ) -> None:
+        if service is None or self.is_main_service(service):
+            await self.upload_dir(source_dir, target_dir)
+            return
+        transport = self._compose_service_transport(service)
+        await transport.service_upload_dir(source_dir, target_dir, service=service)
 
     @override
     async def service_download_file(

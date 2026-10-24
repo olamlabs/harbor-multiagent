@@ -2162,8 +2162,14 @@ class _GKEDinDCompose(DinDComposeOps):
         reraise=True,
     )
     @override
-    async def upload_file(self, source_path: Path | str, target_path: str) -> None:
-        await super().upload_file(source_path, target_path)
+    async def upload_file(
+        self,
+        source_path: Path | str,
+        target_path: str,
+        *,
+        service: str | None = None,
+    ) -> None:
+        await super().upload_file(source_path, target_path, service=service)
 
     @retry(
         stop=stop_after_attempt(5),
@@ -2171,8 +2177,14 @@ class _GKEDinDCompose(DinDComposeOps):
         reraise=True,
     )
     @override
-    async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
-        await super().upload_dir(source_dir, target_dir)
+    async def upload_dir(
+        self,
+        source_dir: Path | str,
+        target_dir: str,
+        *,
+        service: str | None = None,
+    ) -> None:
+        await super().upload_dir(source_dir, target_dir, service=service)
 
     @retry(
         stop=stop_after_attempt(3),
