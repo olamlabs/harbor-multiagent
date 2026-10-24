@@ -23,7 +23,7 @@ several Harbor agents in one environment, each in its own Compose service
 | `src/harbor/environments/docker/docker_unix.py` | The upload helpers take a service; they were hard-coded to `main`. |
 | `src/harbor/environments/dind_compose.py` | `upload_file` and `upload_dir` take a service, as the downloads do, and the transport gains `service_upload_file` and `service_upload_dir`, so every cloud environment that runs Compose through this layer can host multi-agent tasks. |
 | `src/harbor/environments/compose_service_ops.py` | `service_upload_file` and `service_upload_dir` on the shared mixin, dispatching to `main` or the compose transport like the downloads. |
-| `src/harbor/environments/gke.py` | Its retrying upload overrides take the service argument through. |
+| `src/harbor/environments/gke.py` | Its retrying upload overrides take the service argument through. Each exec gets a `CoreV1Api` of its own: `stream()` patches `ApiClient.request` during the handshake, and several agents exec at once, so a shared client made a concurrent REST call (the pod delete at cleanup) fail as a bad handshake. |
 | `src/harbor/agents/installed/codex.py` | The installer uses an existing `npm` before falling back to the nvm download from GitHub, so an image that ships Node installs the latest Codex from the npm registry without reaching GitHub. |
 | `docs-mintlify/docs.json` | Lists `tasks/multi-agent` in the Tasks group. |
 | `src/harbor/cli/trials.py` | `harbor trial start` lists a seat trial's participants (`seat: harness model`, agents under test marked) where it prints `Agent:` for one agent. |

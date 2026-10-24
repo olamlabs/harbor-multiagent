@@ -1735,3 +1735,23 @@ class TestGKEImageTag:
 
         assert await gke_env._image_exists() is True
         assert gke_env._get_image_url() in recorded[0]
+
+
+class TestGKEExecApi:
+    def test_each_exec_gets_its_own_api_client(self, gke_env):
+        """stream() patches ApiClient.request during the handshake, so execs that
+        overlap, and REST calls made meanwhile, must not share the ApiClient."""
+        gke_env._core_api = k8s_client.CoreV1Api(k8s_client.ApiClient())
+
+        first = gke_env._exec_api()
+        second = gke_env._exec_api()
+
+        assert isinstance(first, k8s_client.CoreV1Api)
+        assert first.api_client is not second.api_client
+        assert first.api_client is not gke_env._api.api_client
+
+    def test_exec_api_needs_an_initialized_environment(self, gke_env):
+        gke_env._core_api = None
+
+        with pytest.raises(RuntimeError):
+            gke_env._exec_api()

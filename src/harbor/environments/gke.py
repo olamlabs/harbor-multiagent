@@ -524,6 +524,17 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 "GCP_PROJECT environment variable, or configure gcloud default project."
             )
 
+    def _exec_api(self) -> k8s_client.CoreV1Api:
+        """A CoreV1Api of its own for one exec or attach.
+
+        ``kubernetes.stream.stream`` temporarily replaces ``ApiClient.request``
+        with the websocket handshake. Execs that run at the same time, or a REST
+        call made while one is starting (pod delete at cleanup), must not share
+        that ApiClient, or the REST call is answered as a failed handshake.
+        """
+        self._api
+        return k8s_client.CoreV1Api(k8s_client.ApiClient())
+
     @property
     def _api(self) -> k8s_client.CoreV1Api:
         """Return the Kubernetes API client, raising if not initialized."""
@@ -1063,7 +1074,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         try:
             resp = await asyncio.to_thread(
                 stream,
-                self._api.connect_get_namespaced_pod_exec,
+                self._exec_api().connect_get_namespaced_pod_exec,
                 self.pod_name,
                 self.namespace,
                 command=exec_command,
@@ -1237,7 +1248,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 test_command = ["true"]
                 resp = await asyncio.to_thread(
                     stream,
-                    self._api.connect_get_namespaced_pod_exec,
+                    self._exec_api().connect_get_namespaced_pod_exec,
                     self.pod_name,
                     self.namespace,
                     command=test_command,
@@ -1302,7 +1313,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
         resp = await asyncio.to_thread(
             stream,
-            self._api.connect_get_namespaced_pod_exec,
+            self._exec_api().connect_get_namespaced_pod_exec,
             self.pod_name,
             self.namespace,
             command=exec_command,
@@ -1354,7 +1365,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         try:
             resp = await asyncio.to_thread(
                 stream,
-                self._api.connect_get_namespaced_pod_exec,
+                self._exec_api().connect_get_namespaced_pod_exec,
                 self.pod_name,
                 self.namespace,
                 command=exec_command,
@@ -1403,7 +1414,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
         resp = await asyncio.to_thread(
             stream,
-            self._api.connect_get_namespaced_pod_exec,
+            self._exec_api().connect_get_namespaced_pod_exec,
             self.pod_name,
             self.namespace,
             command=exec_command,
@@ -1455,7 +1466,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         try:
             resp = await asyncio.to_thread(
                 stream,
-                self._api.connect_get_namespaced_pod_exec,
+                self._exec_api().connect_get_namespaced_pod_exec,
                 self.pod_name,
                 self.namespace,
                 command=exec_command,
@@ -1663,7 +1674,7 @@ class _GKEDinDCompose(DinDComposeOps):
         try:
             resp = await asyncio.to_thread(
                 stream,
-                env._api.connect_get_namespaced_pod_exec,
+                env._exec_api().connect_get_namespaced_pod_exec,
                 env.pod_name,
                 env.namespace,
                 container=self._DIND_CONTAINER,
@@ -1745,7 +1756,7 @@ class _GKEDinDCompose(DinDComposeOps):
         env = self._env
         resp = await asyncio.to_thread(
             stream,
-            env._api.connect_get_namespaced_pod_exec,
+            env._exec_api().connect_get_namespaced_pod_exec,
             env.pod_name,
             env.namespace,
             container=self._DIND_CONTAINER,
@@ -1803,7 +1814,7 @@ class _GKEDinDCompose(DinDComposeOps):
         env = self._env
         resp = await asyncio.to_thread(
             stream,
-            env._api.connect_get_namespaced_pod_exec,
+            env._exec_api().connect_get_namespaced_pod_exec,
             env.pod_name,
             env.namespace,
             container=self._DIND_CONTAINER,
