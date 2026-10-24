@@ -476,7 +476,14 @@ class Trial(ABC):
             task.config, config.environment, config.verifier
         ):
             global_logger.warning("Task %s: %s", task.name, warning)
+        if config.participants and not task.config.agents:
+            raise ValueError(
+                f"Task {task.name} has no [agents.<service>] seats, so it takes "
+                "agent, not participants."
+            )
         if config.source_trial is not None:
+            if task.config.agents:
+                raise ValueError(f"Regrade does not support seat tasks ({task.name}).")
             # TODO: one example could be harbor analyze
             if config.source_trial.action != "regrade":
                 raise NotImplementedError(
@@ -504,7 +511,15 @@ class Trial(ABC):
                 _source_trial_dir=source_trial_dir,
             )
 
-        if task.has_steps:
+        if task.config.agents:
+            from harbor.trial.seats import SeatsTrial
+
+            trial = SeatsTrial(
+                config,
+                _task=task,
+                _task_download_result=task_download_result,
+            )
+        elif task.has_steps:
             from harbor.trial.multi_step import MultiStepTrial
 
             trial = MultiStepTrial(
@@ -1230,9 +1245,15 @@ class Trial(ABC):
         self._log_handler.close()
         self._log_handler = None
 
-    def _scrub_jobs_dir(self) -> None:
+    def _secrets_to_scrub(
+        self,
+        primary_agent: BaseAgent | None = None,
+        primary_config: AgentConfig | None = None,
+    ) -> set[str]:
+        primary_agent = self.agent if primary_agent is None else primary_agent
+        primary_config = self.config.agent if primary_config is None else primary_config
         env_sources = [
-            self.agent.extra_env,
+            primary_agent.extra_env,
             self.task.config.verifier.env,
             self.config.verifier.env,
         ]
@@ -1251,7 +1272,7 @@ class Trial(ABC):
         # ACP exec envs carry every MCP header under an AUTH-named variable.
         # Only the header credentials in mcp_header_env.secrets are secrets.
         mcp_header_env_keys: set[str] = set()
-        for agent in (self.agent, self.user_agent):
+        for agent in (primary_agent, self.user_agent):
             if agent is None:
                 continue
             try:
@@ -1271,7 +1292,7 @@ class Trial(ABC):
                     except ValueError:
                         continue
         # Explicitly selected credentials are sensitive regardless of their name.
-        for config in (self.config.agent, self.config.user_agent):
+        for config in (primary_config, self.config.user_agent):
             if config is None or not (key := config.model_api_key_name):
                 continue
             try:
@@ -1282,7 +1303,10 @@ class Trial(ABC):
                 secrets.add(value)
         # A flag such as CODEX_FORCE_AUTH_JSON=1 has a sensitive name but no
         # secret value, and replacing every "1" would corrupt the output.
-        secrets = {secret for secret in secrets if not is_bool_env_value(secret)}
+        return {secret for secret in secrets if not is_bool_env_value(secret)}
+
+    def _scrub_jobs_dir(self) -> None:
+        secrets = self._secrets_to_scrub()
         if not secrets:
             return
         ordered_secrets = sorted(secrets, key=len, reverse=True)
@@ -1714,10 +1738,13 @@ class Trial(ABC):
             multiplier=self.config.verifier_timeout_multiplier,
         )
 
-    def _compute_agent_setup_timeout_sec(self) -> float:
-        base_timeout_sec = self.config.agent.override_setup_timeout_sec
+    def _compute_agent_setup_timeout_sec(
+        self, agent_config: AgentConfig | None = None
+    ) -> float:
+        agent_config = self.config.agent if agent_config is None else agent_config
+        base_timeout_sec = agent_config.override_setup_timeout_sec
         if base_timeout_sec is None:
-            agent_cls = AgentFactory.get_agent_class_from_config(self.config.agent)
+            agent_cls = AgentFactory.get_agent_class_from_config(agent_config)
             base_timeout_sec = agent_cls.DEFAULT_SETUP_TIMEOUT_SEC
 
         return self._resolve_timeout_sec(
@@ -1749,37 +1776,43 @@ class Trial(ABC):
             resolved = resolve_skill_sources(str_sources)
             agent.skills = [str(s) for s in resolved]
 
-    def _validate_agent_capabilities(self) -> None:
+    def _validate_agent_capabilities(
+        self,
+        primary_agent: BaseAgent | None = None,
+        primary_config: AgentConfig | None = None,
+    ) -> None:
         """Check required agent capabilities before startup, within the trial error boundary."""
+        primary_agent = self.agent if primary_agent is None else primary_agent
+        primary_config = self.config.agent if primary_config is None else primary_config
         if (
             self.agent_environment.os == TaskOS.WINDOWS
-            and not self.agent.capabilities.windows
+            and not primary_agent.capabilities.windows
         ):
             raise RuntimeError(
-                f"Agent '{self.agent.name()}' does not support Windows containers. "
+                f"Agent '{primary_agent.name()}' does not support Windows containers. "
                 "Only agents with capabilities.windows = True can run Windows tasks "
                 "(currently: oracle, nop)."
             )
-        utility_agent = self.config.agent.name in (
+        utility_agent = primary_config.name in (
             AgentName.ORACLE.value,
             AgentName.NOP.value,
         )
-        requires_skills = bool(self.config.agent.skills) or (
+        requires_skills = bool(primary_config.skills) or (
             not utility_agent and bool(self._effective_skills_dir)
         )
-        if requires_skills and not self.agent.capabilities.skills:
+        if requires_skills and not primary_agent.capabilities.skills:
             raise ValueError(
-                f"Agent '{self.agent.name()}' does not support skills; "
+                f"Agent '{primary_agent.name()}' does not support skills; "
                 "configured skills require capabilities.skills = True."
             )
-        for role, agent in (("Agent", self.agent), ("User agent", self.user_agent)):
+        for role, agent in (("Agent", primary_agent), ("User agent", self.user_agent)):
             if agent is None:
                 continue
             # Utility agents ignore task servers, but still reject unsupported
             # servers explicitly configured on the agent.
             servers = (
-                self.config.agent.mcp_servers
-                if agent is self.agent and utility_agent
+                primary_config.mcp_servers
+                if agent is primary_agent and utility_agent
                 else agent.mcp_servers
             )
             if servers and not agent.capabilities.mcp_servers:

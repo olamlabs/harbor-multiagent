@@ -51,14 +51,14 @@ class UnixOps:
         target = PurePosixPath(target_path)
         return target.parent.as_posix(), target.name
 
-    async def _container_path_is_dir(self, target_path: str) -> bool:
+    async def _container_path_is_dir(self, target_path: str, service: str) -> bool:
         result = await self._env._run_docker_compose_command(
             [
                 "exec",
                 "-T",
                 "-u",
                 "root",
-                MAIN_SERVICE_NAME,
+                service,
                 "test",
                 "-d",
                 target_path,
@@ -87,14 +87,16 @@ class UnixOps:
             tar.add(source, arcname=arcname, filter=self._reset_tar_owner)
         return buffer.getvalue()
 
-    async def _extract_tar(self, tar_bytes: bytes, target_dir: str) -> None:
+    async def _extract_tar(
+        self, tar_bytes: bytes, target_dir: str, service: str
+    ) -> None:
         await self._env._run_docker_compose_command(
             [
                 "exec",
                 "-T",
                 "-u",
                 "root",
-                MAIN_SERVICE_NAME,
+                service,
                 "mkdir",
                 "-p",
                 target_dir,
@@ -107,7 +109,7 @@ class UnixOps:
                 "-T",
                 "-u",
                 "root",
-                MAIN_SERVICE_NAME,
+                service,
                 "tar",
                 "-xf",
                 "-",
@@ -119,20 +121,22 @@ class UnixOps:
         )
 
     async def _upload_file_with_tar(
-        self, source_path: Path | str, target_path: str
+        self, source_path: Path | str, target_path: str, service: str
     ) -> None:
         target_is_dir = False
         if not target_path.endswith("/"):
-            target_is_dir = await self._container_path_is_dir(target_path)
+            target_is_dir = await self._container_path_is_dir(target_path, service)
         target_dir, target_name = self._container_file_target(
             source_path, target_path, target_is_dir=target_is_dir
         )
-        await self._extract_tar(self._tar_file(source_path, target_name), target_dir)
+        await self._extract_tar(
+            self._tar_file(source_path, target_name), target_dir, service
+        )
 
     async def _upload_dir_with_tar(
-        self, source_dir: Path | str, target_dir: str
+        self, source_dir: Path | str, target_dir: str, service: str
     ) -> None:
-        await self._extract_tar(self._tar_dir_contents(source_dir), target_dir)
+        await self._extract_tar(self._tar_dir_contents(source_dir), target_dir, service)
 
     async def _fallback_to_tar(
         self, cp_error: RuntimeError, operation: Callable[[], Awaitable[None]]
@@ -149,34 +153,48 @@ class UnixOps:
                 f"cp error: {cp_error}. tar error: {tar_error}"
             ) from tar_error
 
-    async def upload_file(self, source_path: Path | str, target_path: str) -> None:
+    async def upload_file(
+        self,
+        source_path: Path | str,
+        target_path: str,
+        service: str | None = None,
+    ) -> None:
+        service = service or MAIN_SERVICE_NAME
         try:
             await self._env._run_docker_compose_command(
                 [
                     "cp",
                     self._compose_host_path(source_path),
-                    f"{MAIN_SERVICE_NAME}:{target_path}",
+                    f"{service}:{target_path}",
                 ],
                 check=True,
             )
         except RuntimeError as cp_error:
             await self._fallback_to_tar(
-                cp_error, lambda: self._upload_file_with_tar(source_path, target_path)
+                cp_error,
+                lambda: self._upload_file_with_tar(source_path, target_path, service),
             )
 
-    async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
+    async def upload_dir(
+        self,
+        source_dir: Path | str,
+        target_dir: str,
+        service: str | None = None,
+    ) -> None:
+        service = service or MAIN_SERVICE_NAME
         try:
             await self._env._run_docker_compose_command(
                 [
                     "cp",
                     f"{self._compose_host_path(source_dir)}/.",
-                    f"{MAIN_SERVICE_NAME}:{target_dir}",
+                    f"{service}:{target_dir}",
                 ],
                 check=True,
             )
         except RuntimeError as cp_error:
             await self._fallback_to_tar(
-                cp_error, lambda: self._upload_dir_with_tar(source_dir, target_dir)
+                cp_error,
+                lambda: self._upload_dir_with_tar(source_dir, target_dir, service),
             )
         # Fix CRLF line endings when the host is Windows: shell scripts with
         # Windows line endings fail to execute inside the Linux container.
@@ -184,7 +202,7 @@ class UnixOps:
             await self._env._run_docker_compose_command(
                 [
                     "exec",
-                    MAIN_SERVICE_NAME,
+                    service,
                     "bash",
                     "-c",
                     f"find {target_dir} -type f \\( -name '*.sh' -o -name '*.py' "

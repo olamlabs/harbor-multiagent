@@ -72,6 +72,26 @@ class StepResult(BaseModel):
     verifier: TimingInfo | None = None
 
 
+class SeatResult(BaseModel):
+    """One seat's agent run, recorded like a step's."""
+
+    seat: str
+    under_test: bool
+    agent_info: AgentInfo | None = None
+    agent_result: AgentContext | None = None
+    agent_setup: TimingInfo | None = None
+    agent_execution: TimingInfo | None = None
+    exception_info: ExceptionInfo | None = None
+    ended_by_play_end: bool = Field(
+        default=False,
+        description=(
+            "The agent was still running when play ended, because every agent "
+            "under test had ended or the agent timeout ran out; false when the "
+            "trial aborted."
+        ),
+    )
+
+
 class TrialResult(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     task_name: str
@@ -100,16 +120,20 @@ class TrialResult(BaseModel):
     agent_execution: TimingInfo | None = None
     verifier: TimingInfo | None = None
     step_results: list[StepResult] | None = None
+    seat_results: list[SeatResult] | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
 
     def _recorded_exceptions(self) -> list[ExceptionInfo]:
-        """Trial-level exception first, then step exceptions in step order.
+        """Trial-level exception first, then step or seat exceptions in order.
 
-        Multi-step trials record handled failures on the step, not the trial.
+        Multi-step and multi-agent trials record handled failures on each step
+        or seat as well.
         """
         exceptions: list[ExceptionInfo] = []
         if self.exception_info is not None:
             exceptions.append(self.exception_info)
-        for step in self.step_results or []:
+        for step in [*(self.step_results or []), *(self.seat_results or [])]:
             if step.exception_info is not None:
                 exceptions.append(step.exception_info)
         return exceptions
@@ -134,16 +158,17 @@ class TrialResult(BaseModel):
 
         Single-step trials record an ``AgentContext`` on ``agent_result``;
         multi-step trials never set that and instead record one per step on
-        ``step_results[i].agent_result``. Aggregate whichever is populated.
+        ``step_results[i].agent_result``, and multi-agent trials one per seat on
+        ``seat_results[i].agent_result``. Aggregate whichever is populated.
         Returned fields preserve the same semantics as ``AgentContext`` —
         in particular ``n_input_tokens`` is total input *including* cache.
         """
         if self.agent_result is not None:
             contexts = [self.agent_result]
-        elif self.step_results:
+        elif self.step_results or self.seat_results:
             contexts = [
                 sr.agent_result
-                for sr in self.step_results
+                for sr in [*(self.step_results or []), *(self.seat_results or [])]
                 if sr.agent_result is not None
             ]
         else:

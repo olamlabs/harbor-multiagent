@@ -649,6 +649,7 @@ def start(
 ):
     """Start a single trial."""
     from harbor.models.trial.result import TrialResult
+    from harbor.trial.seats import SeatsTrial
     from harbor.trial.trial import Trial
 
     base_config = None
@@ -855,8 +856,17 @@ def start(
 
         console.print(f"Starting trial: {config.trial_name}")
         console.print(f"Task: {config.task.get_task_id().get_name()}")
-        agent_display = config.agent.name or config.agent.import_path or "unknown"
-        console.print(f"Agent: {agent_display}")
+        if isinstance(trial, SeatsTrial):
+            console.print("Participants:")
+            for seat in trial.seats:
+                participant = seat.participant
+                agent_display = participant.name or participant.import_path or "unknown"
+                under_test = "(under test)" if seat.under_test else None
+                parts = [agent_display, participant.model_name, under_test]
+                console.print(f"  {seat.name}: {' '.join(p for p in parts if p)}")
+        else:
+            agent_display = config.agent.name or config.agent.import_path or "unknown"
+            console.print(f"Agent: {agent_display}")
         environment_display = config.environment.import_path or (
             config.environment.type.value if config.environment.type else "unknown"
         )

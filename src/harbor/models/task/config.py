@@ -12,7 +12,7 @@ from pathlib import PurePosixPath
 from typing import Any, Literal
 
 import toml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from harbor.constants import MAIN_SERVICE_NAME, ORG_NAME_PATTERN
 from harbor.models.task.step_name import step_name_key, validate_step_name
@@ -843,6 +843,25 @@ class StepConfig(BaseModel):
         return validate_step_name(value)
 
 
+class SeatConfig(BaseModel):
+    """One seat: the Compose service named by its ``[agents.<service>]`` key gets
+    a Harbor agent. Its image, files, user and workdir come from Compose."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    under_test: bool = Field(
+        default=True,
+        description=(
+            "Whether this agent is under test. Play lasts until every agent "
+            "under test has ended; the others never hold it open."
+        ),
+    )
+    mcp_servers: list[MCPServerConfig] = Field(
+        default_factory=list,
+        description="Added to [environment] mcp_servers for this seat's agent.",
+    )
+
+
 class MultiStepRewardStrategy(str, Enum):
     """Strategy for deriving a trial-level reward from per-step verifier results."""
 
@@ -876,6 +895,40 @@ class TaskConfig(BaseModel):
     )
     steps: list[StepConfig] | None = None
     artifacts: list[str | ArtifactConfig] = Field(default_factory=list)
+    agents: dict[str, SeatConfig] = Field(
+        default_factory=dict,
+        exclude_if=lambda v: not v,
+        description=(
+            "Agents, keyed by the Compose service each runs in. Each one's "
+            "instruction is instructions/<service>.md, and a trial or job "
+            "config's participants choose the harness and model for each."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_seats(self) -> "TaskConfig":
+        if not self.agents:
+            return self
+        for service in self.agents:
+            if _validate_compose_service_name(service) != service:
+                raise ValueError(f"Invalid seat name: {service!r}")
+        if MAIN_SERVICE_NAME in self.agents:
+            raise ValueError(
+                f"'{MAIN_SERVICE_NAME}' cannot be a seat: the verifier runs there."
+            )
+        if self.steps:
+            raise ValueError("A task with [agents.<service>] seats cannot have steps.")
+        if not any(seat.under_test for seat in self.agents.values()):
+            raise ValueError(
+                "A task with [agents.<service>] seats needs at least one agent "
+                "under test."
+            )
+        if self.agent.user is not None:
+            raise ValueError(
+                "[agent] user does not apply to seats; set user: on each seat's "
+                "Compose service."
+            )
+        return self
 
     @field_validator("steps")
     @classmethod

@@ -83,7 +83,7 @@ class Task:
 
         if not disable_verification:
             self._validate_tests(self.config, self.paths, file_filter=self.file_filter)
-        if self.has_steps:
+        if self.has_steps or self.config.agents:
             self.instruction = ""
         else:
             self.instruction = self._append_extra_instructions(
@@ -130,7 +130,7 @@ class Task:
                     and paths.step_instruction_path(step.name).exists()
                     for step in config.steps
                 )
-            return paths.instruction_path.exists()
+            return bool(config.agents) or paths.instruction_path.exists()
 
         try:
             Task._validate_tests(config, paths)
@@ -155,6 +155,16 @@ class Task:
             )
         paths.validate_input_tree(paths.tests_dir, exclude=file_filter.is_excluded)
         paths.validate_input_tree(paths.solution_dir, exclude=file_filter.is_excluded)
+        Task._validate_seats(config, paths)
+
+    @staticmethod
+    def _validate_seats(config: TaskConfig, paths: TaskPaths) -> None:
+        """Each seat needs instructions/<seat>.md."""
+        for seat in config.agents:
+            if not paths.seat_instruction_path(seat).is_file():
+                raise FileNotFoundError(
+                    f"Seat {seat!r} has no instruction: expected instructions/{seat}.md"
+                )
 
     @staticmethod
     def _validate_tests(
@@ -166,7 +176,7 @@ class Task:
         """Raise FileNotFoundError if host artifacts required at runtime are missing."""
         file_filter = file_filter or TaskFileFilter(paths.task_dir)
         if not config.steps:
-            if not paths.instruction_path.exists():
+            if not config.agents and not paths.instruction_path.exists():
                 raise FileNotFoundError(
                     f"Task directory {paths.task_dir} is missing instruction.md."
                 )
@@ -240,6 +250,10 @@ class Task:
         return self._append_extra_instructions(
             strip_canary(path.read_text()),
         )
+
+    def seat_instruction(self, seat: str) -> str:
+        path = self.paths.seat_instruction_path(seat)
+        return self._append_extra_instructions(strip_canary(path.read_text()))
 
     @property
     def checksum(self) -> str:

@@ -23,6 +23,7 @@ from harbor.models.task.verifier_mode import resolve_task_verifier_mode
 from harbor.models.trial.config import (
     AgentConfig,
     EnvironmentConfig,
+    Participant,
     TaskConfig,
     TrialConfig,
     UserAgentConfig,
@@ -183,6 +184,9 @@ class TrialLock(BaseModel):
     environment_build_timeout_multiplier: float | None = None
     extra_instructions: list[ExtraInstructionLock] | None = None
     agent: AgentConfig
+    participants: list[Participant] = Field(
+        default_factory=list, exclude_if=lambda v: not v
+    )
     user_agent: UserAgentConfig | None = None
     user_persona: ExtraInstructionLock | None = None
     user_prompt_template: ExtraInstructionLock | None = None
@@ -212,6 +216,7 @@ class TrialLock(BaseModel):
             self.environment_build_timeout_multiplier,
             _lock_list_equality_key(self.extra_instructions),
             _frozen_value(self.agent, exclude={"skills"}),
+            tuple(_frozen_value(participant) for participant in self.participants),
             _user_agent_equality_key(
                 self.user_agent, bridge_input_names=set(self.bridge_inputs)
             ),
@@ -499,6 +504,7 @@ def build_trial_lock(
             else None
         ),
         agent=trial_config.agent,
+        participants=trial_config.participants,
         user_agent=trial_config.user_agent,
         user_persona=(
             ExtraInstructionLock(

@@ -57,6 +57,10 @@ class TaskPaths:
         """Path to the instruction.md file."""
         return self.task_dir / "instruction.md"
 
+    def seat_instruction_path(self, seat: str) -> Path:
+        """Path to a seat's instructions/<seat>.md file."""
+        return self.task_dir / "instructions" / f"{seat}.md"
+
     @property
     def trajectory_path(self) -> Path:
         """Path to the task's ATIF trajectory.json file."""

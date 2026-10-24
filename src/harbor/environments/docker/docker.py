@@ -1336,6 +1336,34 @@ class DockerEnvironment(BaseEnvironment):
         await platform.download_dir(source_dir, target_dir, service=service)
 
     @override
+    async def service_upload_file(
+        self,
+        source_path: Path | str,
+        target_path: str,
+        *,
+        service: str | None = None,
+    ) -> None:
+        if service is None or service == MAIN_SERVICE_NAME:
+            await self.upload_file(source_path, target_path)
+            return
+        platform = self._sidecar_platform(service)
+        await platform.upload_file(source_path, target_path, service=service)
+
+    @override
+    async def service_upload_dir(
+        self,
+        source_dir: Path | str,
+        target_dir: str,
+        *,
+        service: str | None = None,
+    ) -> None:
+        if service is None or service == MAIN_SERVICE_NAME:
+            await self.upload_dir(source_dir, target_dir)
+            return
+        platform = self._sidecar_platform(service)
+        await platform.upload_dir(source_dir, target_dir, service=service)
+
+    @override
     async def stop_service(self, service: str) -> None:
         """Stop one compose service while keeping the rest of the project up."""
         await self._run_docker_compose_command(["stop", service])

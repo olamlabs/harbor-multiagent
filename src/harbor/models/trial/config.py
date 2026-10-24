@@ -10,8 +10,10 @@ from pydantic import (
     BaseModel,
     Field,
     SerializationInfo,
+    SerializerFunctionWrapHandler,
     field_serializer,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from shortuuid import ShortUUID
@@ -207,6 +209,46 @@ class AgentConfig(BaseModel):
             separators=(",", ":"),
         )
         return "agent:" + hashlib.sha256(serialized_identity.encode()).hexdigest()
+
+
+class Participant(AgentConfig):
+    """The agent and model for the service a task names ``[agents.<seat>]``.
+
+    Timeouts, concurrency, skills, trajectory loading and network allowlists
+    apply to the whole trial, so a participant cannot set them.
+    """
+
+    seat: str
+
+    @model_validator(mode="after")
+    def _refuse_per_agent_run_settings(self):
+        unsupported = [
+            name
+            for name in (
+                "override_timeout_sec",
+                "max_timeout_sec",
+                "n_concurrent",
+                "concurrency_group",
+                "skills",
+                "load_trajectory",
+                "extra_allowed_hosts",
+            )
+            if getattr(self, name) not in (None, [])
+        ]
+        if unsupported:
+            raise ValueError(
+                f"Participant for seat {self.seat!r} sets {', '.join(unsupported)}, "
+                "which a participant cannot set. Every agent's timeout is the task's "
+                "[agent] timeout_sec."
+            )
+        return self
+
+
+def validate_participants(participants: list[Participant]) -> list[Participant]:
+    seats = [participant.seat for participant in participants]
+    if duplicates := sorted({seat for seat in seats if seats.count(seat) > 1}):
+        raise ValueError(f"Seats {duplicates} have more than one participant.")
+    return participants
 
 
 class UserAgentConfig(AgentConfig):
@@ -501,6 +543,11 @@ class TrialConfig(BaseModel):
     agent_setup_timeout_multiplier: float | None = None
     environment_build_timeout_multiplier: float | None = None
     agent: AgentConfig = Field(default_factory=AgentConfig)
+    participants: list[Participant] = Field(
+        default_factory=list,
+        exclude_if=lambda v: not v,
+        description="One agent per seat of a task with [agents.<service>] seats.",
+    )
     user_agent: UserAgentConfig | None = Field(
         default=None,
         description=(
@@ -540,6 +587,20 @@ class TrialConfig(BaseModel):
     @property
     def is_regrade(self) -> bool:
         return self.source_trial is not None
+
+    @model_serializer(mode="wrap")
+    def _omit_agent_for_seats(self, handler: SerializerFunctionWrapHandler):
+        """A seat trial runs its participants, never ``agent``, so its records
+        leave ``agent`` out rather than name a harness that did not run."""
+        data = handler(self)
+        if self.participants:
+            data.pop("agent", None)
+        return data
+
+    @field_validator("participants")
+    @classmethod
+    def _validate_participants(cls, value: list[Participant]) -> list[Participant]:
+        return validate_participants(value)
 
     @override
     def __eq__(self, other):

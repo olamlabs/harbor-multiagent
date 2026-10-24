@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Literal, override
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from harbor.models.metric.config import MetricConfig
 from harbor.models.task.id import GitTaskId, LocalTaskId, PackageTaskId
@@ -15,9 +15,11 @@ from harbor.models.trial.config import (
     AgentConfig,
     ArtifactConfig,
     EnvironmentConfig,
+    Participant,
     TaskConfig,
     UserAgentConfig,
     VerifierConfig,
+    validate_participants,
 )
 
 
@@ -432,6 +434,11 @@ class JobConfig(BaseModel):
     verifier: VerifierConfig = Field(default_factory=VerifierConfig)
     metrics: list[MetricConfig] = Field(default_factory=list)
     agents: list[AgentConfig] = Field(default_factory=lambda: [AgentConfig()])
+    participants: list[Participant] = Field(
+        default_factory=list,
+        exclude_if=lambda v: not v,
+        description="One agent per seat, applied to every seat task in the job.",
+    )
     user_agent: UserAgentConfig | None = Field(
         default=None,
         description=(
@@ -490,6 +497,11 @@ class JobConfig(BaseModel):
     @classmethod
     def _migrate_legacy_config_fields(cls, data):
         return migrate_legacy_job_config(data)
+
+    @field_validator("participants")
+    @classmethod
+    def _validate_participants(cls, value: list[Participant]) -> list[Participant]:
+        return validate_participants(value)
 
     @model_validator(mode="after")
     def validate_agent_concurrency(self):
