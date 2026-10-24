@@ -1,0 +1,26 @@
+schema_version = "1.4"
+artifacts = ["/logs/world/notes.jsonl"]
+
+[task]
+name = "harbor/hello-seats"
+description = "Two seats post notes to one world; p1 is under test, p2 supports it."
+keywords = ["seats", "docker-compose", "multi-agent"]
+
+[metadata]
+difficulty = "easy"
+category = "example"
+tags = ["seats", "trivial"]
+
+[verifier]
+timeout_sec = 120.0
+
+[agent]
+timeout_sec = 600.0
+
+[environment]
+build_timeout_sec = 600.0
+
+[agents.p1]
+
+[agents.p2]
+under_test = false

@@ -1,0 +1,32 @@
+x-player: &player
+  build: ./player
+  user: player
+  working_dir: /home/player
+  command: ["sleep", "infinity"]
+  init: true
+  networks: [play]
+  depends_on:
+    main:
+      condition: service_healthy
+
+services:
+  main:
+    command: ["python3", "/world/world.py"]
+    networks:
+      play:
+        aliases: [world]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=2)"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 2s
+  p1:
+    <<: *player
+    environment: {SEAT: p1}
+  p2:
+    <<: *player
+    environment: {SEAT: p2}
+
+networks:
+  play: {}
