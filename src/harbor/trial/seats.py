@@ -21,8 +21,6 @@ from typing import Any, override
 from harbor.agents.base import BaseAgent
 from harbor.agents.factory import AgentFactory
 from harbor.agents.installed.base import NonZeroAgentExitCodeError
-from harbor.environments.base import BaseEnvironment
-from harbor.environments.factory import _load_environment_class
 from harbor.environments.seat import SeatEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.agent.name import AgentName
@@ -33,7 +31,6 @@ from harbor.models.task.verifier_mode import (
     resolve_task_verifier_mode,
 )
 from harbor.models.trial.config import AgentConfig, Participant, TrialConfig
-from harbor.models.trial.config import EnvironmentConfig as TrialEnvironmentConfig
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import ExceptionInfo, SeatResult, TimingInfo
 from harbor.tasks.client import TaskDownloadResult
@@ -41,7 +38,6 @@ from harbor.trial.errors import AgentSetupTimeoutError, AgentTimeoutError
 from harbor.trial.hooks import TrialEvent
 from harbor.trial.network_policy import resolve_trial_network_plan
 from harbor.trial.single_step import SingleStepTrial
-from harbor.utils.import_path import import_class
 from harbor.utils.trajectory_utils import load_model_usage_from_trajectory
 
 
@@ -75,15 +71,6 @@ def check_launch(config: TrialConfig, task: Task) -> None:
         problems.append("agent is set; a seat task takes participants")
     if config.user_agent is not None:
         problems.append("user_agent is not supported for seat tasks")
-    environment = config.environment
-    if not _uploads_to_services(environment):
-        name = environment.import_path or (
-            environment.type.value if environment.type else None
-        )
-        problems.append(
-            f"environment {name} cannot upload files into other Compose "
-            "services, which each agent needs"
-        )
     if resolve_task_verifier_mode(task.config) != VerifierEnvironmentMode.SHARED:
         problems.append("the verifier must run in main (shared mode)")
     plan = resolve_trial_network_plan(
@@ -101,22 +88,6 @@ def check_launch(config: TrialConfig, task: Task) -> None:
         problems.append("seat tasks support only public network_mode")
     if problems:
         raise ValueError(f"Task {task.name} cannot run: {'; '.join(problems)}.")
-
-
-def _uploads_to_services(environment: TrialEnvironmentConfig) -> bool:
-    if environment.import_path is not None:
-        environment_class = import_class(
-            environment.import_path, base=BaseEnvironment, label="environment"
-        )
-    elif environment.type is not None:
-        environment_class = _load_environment_class(environment.type)
-    else:
-        return False
-    return (
-        issubclass(environment_class, BaseEnvironment)
-        and environment_class.service_upload_file
-        is not BaseEnvironment.service_upload_file
-    )
 
 
 @contextlib.asynccontextmanager

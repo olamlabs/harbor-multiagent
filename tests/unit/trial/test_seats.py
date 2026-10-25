@@ -25,16 +25,14 @@ from harbor.models.agent.context import AgentContext
 from harbor.models.job.result import JobStats
 from harbor.models.trial.config import (
     AgentConfig,
-    EnvironmentConfig,
     SourceTrialConfig,
     TaskConfig,
     TrialConfig,
     VerifierConfig,
 )
-from harbor.models.task.task import Task
 from harbor.models.trial.result import TrialResult
 from harbor.models.verifier.result import VerifierResult
-from harbor.trial.seats import SeatsTrial, check_launch
+from harbor.trial.seats import SeatsTrial
 from harbor.trial.single_step import SingleStepTrial
 from harbor.trial.trial import Trial
 
@@ -246,12 +244,6 @@ async def test_regrade_refuses_seat_tasks(tmp_path: Path):
         ),
         (
             ["maya", "raj", "lee"],
-            {"environment": EnvironmentConfig(type="e2b")},
-            "",
-            "environment e2b cannot upload files into other Compose services",
-        ),
-        (
-            ["maya", "raj", "lee"],
             {},
             "network_mode = 'no-network'",
             "only public network_mode",
@@ -275,19 +267,6 @@ async def test_launch_refusals_come_before_any_environment(
 
     with pytest.raises(ValueError, match=message):
         await Trial.create(config)
-
-
-@pytest.mark.parametrize("environment", ["docker", "modal", "daytona", "gke"])
-def test_compose_environments_can_host_seats(tmp_path: Path, environment: str):
-    config = _config(
-        _task_dir(tmp_path),
-        _participant("maya"),
-        _participant("raj"),
-        _participant("lee"),
-        environment=EnvironmentConfig(type=environment),
-    )
-
-    check_launch(config, Task(task_dir=config.task.path))
 
 
 async def test_launch_refusals_are_one_error(tmp_path: Path):
