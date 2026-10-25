@@ -912,10 +912,6 @@ class TaskConfig(BaseModel):
         for service in self.agents:
             if _validate_compose_service_name(service) != service:
                 raise ValueError(f"Invalid seat name: {service!r}")
-        if MAIN_SERVICE_NAME in self.agents:
-            raise ValueError(
-                f"'{MAIN_SERVICE_NAME}' cannot be a seat: the verifier runs there."
-            )
         if self.steps:
             raise ValueError("A task with [agents.<service>] seats cannot have steps.")
         if not any(seat.under_test for seat in self.agents.values()):

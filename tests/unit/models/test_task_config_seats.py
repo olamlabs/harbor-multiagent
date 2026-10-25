@@ -77,7 +77,6 @@ def test_seats_survive_toml_round_trip():
 @pytest.mark.parametrize(
     "toml, message",
     [
-        ("[agents.main]\n", "'main' cannot be a seat"),
         ("[agents.maya]\nunder_test = false\n", "at least one agent under test"),
         ("[agents.maya]\nnetwork_mode = 'no-network'\n", "Extra inputs"),
         ("[agents.maya]\nuser = 'maya'\n", "Extra inputs"),
