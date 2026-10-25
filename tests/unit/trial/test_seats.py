@@ -611,8 +611,6 @@ async def test_each_seat_logs_under_its_own_name(tmp_path: Path):
             verifier=VerifierConfig(disable=True),
         )
     )
-    trial.logger.info("trial line")
-
     await trial.run()
 
     for seat in trial.seats:
@@ -622,10 +620,6 @@ async def test_each_seat_logs_under_its_own_name(tmp_path: Path):
         assert seat.environment.logger.name.startswith(
             f"{trial.logger.name}.seats.{seat.name}."
         )
-    lines = trial.paths.log_path.read_text().splitlines()
-    assert "trial line" in lines
-    for seat in ("maya", "raj", "lee"):
-        assert f"[{seat}] working" in lines
 
 
 def test_trial_start_names_each_participant(tmp_path: Path, monkeypatch):

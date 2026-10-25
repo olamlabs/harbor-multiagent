@@ -12,7 +12,6 @@ container still up.
 
 import asyncio
 import contextlib
-import copy
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -122,37 +121,6 @@ class SeatsTrial(SingleStepTrial):
         super().__init__(
             config, _task=_task, _task_download_result=_task_download_result
         )
-
-    @override
-    def _init_logger(self) -> None:
-        """Calls Trial._init_logger. Each seat logs through the child
-        ``seats.<seat>`` of the trial's logger, and its lines in trial.log
-        start with the seat's name."""
-        super()._init_logger()
-        # Longest logger names first, so a seat named "a.b" is not taken for a
-        # child logger of a seat named "a".
-        seat_loggers = sorted(
-            (
-                (f"{self.logger.name}.seats.{name}", name)
-                for name in self.task.config.agents
-            ),
-            key=lambda pair: len(pair[0]),
-            reverse=True,
-        )
-
-        def name_the_seat(record: logging.LogRecord) -> logging.LogRecord:
-            for logger_name, seat in seat_loggers:
-                if record.name == logger_name or record.name.startswith(
-                    f"{logger_name}."
-                ):
-                    # A copy, so other handlers keep the unprefixed message.
-                    named = copy.copy(record)
-                    named.msg = f"[{seat}] {record.msg}"
-                    return named
-            return record
-
-        if self._log_handler is not None:
-            self._log_handler.addFilter(name_the_seat)
 
     @override
     def _init_agent(self) -> None:
