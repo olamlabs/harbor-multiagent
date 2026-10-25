@@ -1302,14 +1302,14 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         source_path = Path(source_path)
 
         tar_buffer = io.BytesIO()
-        with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
+        with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
             tar.add(str(source_path), arcname=Path(target_path).name)
         tar_buffer.seek(0)
 
         target_dir = str(Path(target_path).parent)
         await self.exec(f"mkdir -p {target_dir}", user="root")
 
-        exec_command = ["tar", "xf", "-", "-C", target_dir]
+        exec_command = ["tar", "xzf", "-", "-C", target_dir]
 
         resp = await asyncio.to_thread(
             stream,
@@ -1351,7 +1351,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
         # Pack the whole tree (preserves permissions, symlinks, and empty
         # directories) instead of adding regular files one by one.
-        tar_buffer = pack_dir_to_bytes(source_dir)
+        tar_buffer = pack_dir_to_bytes(source_dir, compress=True)
         tar_size = len(tar_buffer.getvalue())
 
         mkdir_result = await self.exec(f"mkdir -p {target_dir}", user="root")
@@ -1360,7 +1360,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 f"Failed to create target directory {target_dir}: {mkdir_result.stderr}"
             )
 
-        exec_command = ["tar", "xf", "-", "-C", target_dir]
+        exec_command = ["tar", "xzf", "-", "-C", target_dir]
 
         try:
             resp = await asyncio.to_thread(
@@ -1723,7 +1723,7 @@ class _GKEDinDCompose(DinDComposeOps):
 
         source_path = Path(source_path)
         tar_buffer = io.BytesIO()
-        with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
+        with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
             tar.add(str(source_path), arcname=Path(target_path).name)
         tar_buffer.seek(0)
 
@@ -1744,7 +1744,7 @@ class _GKEDinDCompose(DinDComposeOps):
 
         # Pack the whole tree (preserves permissions, symlinks, and empty
         # directories) instead of adding regular files one by one.
-        tar_buffer = pack_dir_to_bytes(source_dir)
+        tar_buffer = pack_dir_to_bytes(source_dir, compress=True)
 
         await self._pod_exec(f"mkdir -p {shlex.quote(target_dir)}")
         await self._tar_extract_to_pod(tar_buffer, target_dir)
@@ -1760,7 +1760,7 @@ class _GKEDinDCompose(DinDComposeOps):
             env.pod_name,
             env.namespace,
             container=self._DIND_CONTAINER,
-            command=["tar", "xf", "-", "-C", target_dir],
+            command=["tar", "xzf", "-", "-C", target_dir],
             stderr=True,
             stdin=True,
             stdout=True,
