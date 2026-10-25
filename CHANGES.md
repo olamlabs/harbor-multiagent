@@ -13,11 +13,11 @@ several Harbor agents in one environment, each in its own Compose service
 | `src/harbor/models/task/config.py` | `SeatConfig` and `TaskConfig.agents` (`[agents.<service>]`), with the seat refusals at task load. |
 | `src/harbor/models/task/paths.py` | `seat_instruction_path`: `instructions/<seat>.md`. |
 | `src/harbor/models/task/task.py` | Reads each seat's instruction and does not require `instruction.md` for a seat task. |
-| `src/harbor/models/trial/config.py` | `Participant` (an `AgentConfig` plus `seat`) and `TrialConfig.participants`, refusing duplicate seats and per-agent settings seats cannot honor. A seat trial's serialized config leaves out `agent`, which no seat runs; reloading restores Harbor's default. |
+| `src/harbor/models/trial/config.py` | `Participant` (an `AgentConfig` plus `seat`) and `TrialConfig.participants`, refusing duplicate seats and per-agent settings seats cannot honor. |
 | `src/harbor/models/job/config.py` | `JobConfig.participants`. |
 | `src/harbor/job_plan.py` | Passes the job's participants into each trial config, as it does `user_agent`. |
 | `src/harbor/models/job/lock.py` | Records participants in `lock.json` and its equality, so a changed roster is a changed run. |
-| `src/harbor/models/trial/result.py` | `SeatResult` (with `ended_by_play_end`, true when the agents under test or the agent timeout ended play) and `TrialResult.seat_results`; seat errors count as recorded errors and seat usage counts in the token and cost totals. |
+| `src/harbor/models/trial/result.py` | `SeatResult` and `TrialResult.seat_results`; seat errors count as recorded errors and seat usage counts in the token and cost totals. |
 | `src/harbor/environments/base.py` | `service_upload_file` and `service_upload_dir`, raising the existing unsupported-service error off `main`. |
 | `src/harbor/environments/docker/docker.py` | Docker's `service_upload_file` and `service_upload_dir`. |
 | `src/harbor/environments/docker/docker_unix.py` | The upload helpers take a service; they were hard-coded to `main`. |
@@ -41,5 +41,5 @@ agent's.
 | `src/harbor/environments/seat.py` | `SeatEnvironment`: one Compose service of the trial's project as a `BaseEnvironment`, over the per-service operations. Ordinary execs pass no `-u`, so Compose's `user:` applies in full; `default_user` holds that uid for agents' ownership fixes only. |
 | `docs-mintlify/tasks/multi-agent.mdx` | The task format, participants, how a run starts and ends, logs, the verifier, and the limitations. |
 | `examples/tasks/hello-seats/`, `examples/configs/features/seats-trial.yaml`, `examples/configs/features/seats-job.yaml` | A runnable two-agent example task and the trial and job configs that run it. |
-| `tests/unit/models/test_task_config_seats.py`, `tests/unit/models/test_trial_participants.py`, `tests/unit/environments/test_seat.py`, `tests/unit/environments/test_dind_service_upload.py`, `tests/unit/trial/test_seats.py`, `tests/unit/test_hello_seats_example.py` | Unit tests; none needs Docker. |
+| `tests/unit/models/test_task_config_seats.py`, `tests/unit/models/test_trial_participants.py`, `tests/unit/environments/test_seat.py`, `tests/unit/environments/test_dind_service_upload.py`, `tests/unit/trial/test_seats.py` | Unit tests; none needs Docker. |
 | `tests/runtime/test_hello_seats_docker.py` | Runs hello-seats with the oracle in both seats on real Docker. |

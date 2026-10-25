@@ -19,7 +19,7 @@ Each agent runs in its own container, with its own harness, model, instruction a
 - Each agent reads its own `instructions/<service>.md`.
 - A trial or job config fills each agent's service with a participant: an ordinary Harbor agent config plus `seat`, the service it runs in.
 
-The service an agent runs in is its **seat**. The word appears in `participants[].seat`, in `seat_results` and in log prefixes. `main` is never a seat: the verifier runs there.
+The service an agent runs in is its **seat**. The word appears in `participants[].seat` and in `seat_results`.
 
 ## Example
 
@@ -60,12 +60,11 @@ timeout_sec = 120.0
 under_test = false
 ```
 
-Each `[agents.<service>]` table takes two optional keys:
+Each `[agents.<service>]` table takes one optional key:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `under_test` | `true` | The run lasts until every agent under test has ended. Agents with `under_test = false` are supporting agents: they never hold the run open, and Harbor cancels them when it ends. Scoring is unaffected. |
-| `mcp_servers` | `[]` | MCP servers for this agent, added to `[environment] mcp_servers`. A participant's own `mcp_servers` are added last. A server replaces an earlier one with the same name. |
 
 At least one agent must be under test. In the example, p1 is under test and p2 supports it, so the run ends when p1 ends.
 
@@ -122,7 +121,8 @@ Both agents run the same image as the user `player`, wait for `main` to be healt
 
 - It keeps running: Harbor runs the agent inside it with `docker compose exec`. Use `command: ["sleep", "infinity"]` or a long-running process of its own.
 - It has `bash`: Harbor runs every agent command with `bash -c`.
-- It has whatever the harness's install needs, as `main` would in a single-agent task. The example's player image installs `curl`, `git` and Node.js.
+- It has whatever the harness's install needs, as `main` would in a single-agent task. The example's player image installs `curl` and `git`.
+- Harbor installs the harness at setup and skips the install when the image already has it (at the launch's `version`, if one is set). An image may install the harness unpinned at build instead; launches then omit `version`.
 
 The agent's user and working directory are the service's Compose `user:` and `working_dir:`. Harbor passes no `-u` for ordinary commands, so the agent runs with that user's uid and gid; install steps that ask for root run with `-u root`. At setup, Harbor reads the uid with `id -u` and uses it for the harness's file-ownership fixes. Set `user:` on each service rather than `[agent] user`.
 
@@ -161,9 +161,11 @@ participants:
   - seat: p1
     name: codex
     model_name: openai/gpt-5.5
+    kwargs: {disable_web_search: true}
   - seat: p2
     name: codex
     model_name: openai/gpt-5.5
+    kwargs: {disable_web_search: true}
 ```
 
 Run the example's trial config, [`examples/configs/features/seats-trial.yaml`](https://github.com/olamlabs/harbor-multiagent/blob/main/examples/configs/features/seats-trial.yaml), from the repository root with Docker running and `OPENAI_API_KEY` set:
@@ -247,19 +249,16 @@ The job summary reports each key.
 ## Logs and results
 
 - `seats/<service>/agent/`: the agent's logs, and its `trajectory.json` if the harness writes one.
-- `trial.log`: each line logged by an agent or its container starts with the service name, for example `[p1] Running command: ...`.
 - `result.json`:
-  - `config` has `participants` and no `agent`.
+  - `config` has `participants`.
   - `agent_info` is the first agent under test.
   - `agent_setup` and `agent_execution` span all agents.
   - Token and cost totals sum every agent.
-  - `seat_results` lists every agent with `seat`, `under_test`, `agent_info`, `agent_result` (tokens and cost), `agent_setup`, `agent_execution`, `exception_info` and `ended_by_play_end`.
-
-`ended_by_play_end` is `true` for an agent that was still running when the run ended, because every agent under test had ended or the agent timeout ran out.
+  - `seat_results` lists every agent with `seat`, `under_test`, `agent_info`, `agent_result` (tokens and cost), `agent_setup`, `agent_execution` and `exception_info`.
 
 ## Limitations
 
-- Multi-agent tasks need an environment that can exec in, upload to and download from any Compose service: `docker`, `podman`, and the cloud environments that run Compose (`modal`, `daytona`, `gke`, `ec2` and others). Harbor refuses the rest at launch, naming the environment.
+- Multi-agent tasks need an environment that can exec in, upload to and download from any Compose service: `docker`, `podman`, and the cloud environments that run Compose (`modal`, `daytona`, `gke`, `ec2` and others). On the rest, Harbor raises `ServiceOperationsUnsupportedError` at the first operation the environment cannot perform in an agent's container.
 - On `modal`, use the VM runtime (`environment.kwargs: {modal_vm_runtime: true}`). Modal's default sandbox puts every Compose service on host networking, which fails any task that declares `networks:`.
 - The verifier runs in `main`; separate verifiers are not supported.
 - Network mode must be `public`.

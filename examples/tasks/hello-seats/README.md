@@ -50,5 +50,3 @@ The trial folder is under `./trials/` and is named `hello-seats__<id>`.
 - `result.json`: `agent_info` is p1's agent. `seat_results` lists `p1`
   (`under_test: true`) and `p2` (`under_test: false`), each with its own
   `agent_result` (tokens and cost), timings and `exception_info`.
-  `ended_by_play_end` is `true` on p2 when its agent was still running as
-  p1 finished, and `false` when it had stopped before p1 did.
