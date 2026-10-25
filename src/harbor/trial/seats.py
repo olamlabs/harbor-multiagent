@@ -295,37 +295,22 @@ class SeatsTrial(SingleStepTrial):
         timeout. Nothing in the containers is killed, and they stay up. A seat
         error other than its agent exiting non-zero aborts play and fails the
         trial, as it fails a single-agent trial."""
-        loop = asyncio.get_running_loop()
-        clock = self._agent_timeout_sec
-        deadline = None if clock is None else loop.time() + clock
+        timeout_sec = self._agent_timeout_sec
         async with _seat_tasks() as group:
             tasks = {
                 seat.name: group.create_task(self._play_seat(seat))
                 for seat in self.seats
             }
             under_test = [tasks[seat.name] for seat in self.seats if seat.under_test]
-            clock_expired = False
-            # Only agents under test hold play open. Waiting on every running
-            # seat wakes the loop whenever any seat ends.
-            while not all(task.done() for task in under_test):
-                running = [task for task in tasks.values() if not task.done()]
-                remaining = None if deadline is None else deadline - loop.time()
-                done, _ = await asyncio.wait(
-                    running,
-                    timeout=None if remaining is None else max(remaining, 0),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if not done:
-                    clock_expired = True
-                    break
+            _, timed_out = await asyncio.wait(under_test, timeout=timeout_sec)
             for seat in self.seats:
                 if tasks[seat.name].done():
                     continue
-                if clock_expired:
+                if timed_out:
                     seat.result.exception_info = ExceptionInfo(
                         exception_type=AgentTimeoutError.__name__,
                         exception_message=(
-                            f"Agent execution timed out after {clock} seconds"
+                            f"Agent execution timed out after {timeout_sec} seconds"
                         ),
                         exception_traceback="",
                         occurred_at=self._now(),
@@ -333,8 +318,8 @@ class SeatsTrial(SingleStepTrial):
                 tasks[seat.name].cancel()
 
     async def _play_seat(self, seat: Seat) -> None:
-        """Mirrors Trial._run_agent_phase for one seat, without a clock of its
-        own."""
+        """Mirrors Trial._run_agent_phase for one seat, without a timeout of
+        its own."""
         context = AgentContext()
         execution = TimingInfo(started_at=self._now())
         seat.result.agent_result = context

@@ -391,7 +391,7 @@ async def test_seat_user_becomes_default_user_for_ownership_fixes(tmp_path: Path
     assert _service_and_user(list(fix)) == ("maya", "root")
 
 
-async def test_play_clock_ends_everyone_still_running_and_still_grades(
+async def test_agent_timeout_ends_everyone_still_running_and_still_grades(
     tmp_path: Path,
 ):
     trial = await _seats_trial(
