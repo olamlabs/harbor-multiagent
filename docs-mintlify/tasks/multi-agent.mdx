@@ -60,11 +60,12 @@ timeout_sec = 120.0
 under_test = false
 ```
 
-Each `[agents.<service>]` table takes one optional key:
+Each `[agents.<service>]` table takes two optional keys:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `under_test` | `true` | The run lasts until every agent under test has ended. Agents with `under_test = false` are supporting agents: they never hold the run open, and Harbor cancels them when it ends. Scoring is unaffected. |
+| `mcp_servers` | `[]` | MCP servers for this agent only, declared as `[[agents.<service>.mcp_servers]]` with the same fields as [`[[environment.mcp_servers]]`](/tasks/environment#mcps). They are added to the task-wide list for that agent. |
 
 At least one agent must be under test. In the example, p1 is under test and p2 supports it, so the run ends when p1 ends.
 
