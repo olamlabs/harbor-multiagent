@@ -596,7 +596,7 @@ async def test_result_json_records_every_seat(tmp_path: Path):
         assert seat["agent_execution"]["finished_at"] is not None
     config = json.loads(trial.paths.config_path.read_text())
     assert [p["seat"] for p in config["participants"]] == ["maya", "raj", "lee"]
-    assert "agent" not in data["config"] and "agent" not in config
+    assert "agent" not in config
     reloaded = TrialResult.model_validate_json(trial.paths.result_path.read_text())
     assert [p.seat for p in reloaded.config.participants] == ["maya", "raj", "lee"]
 

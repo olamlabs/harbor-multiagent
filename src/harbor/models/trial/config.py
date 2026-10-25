@@ -10,10 +10,8 @@ from pydantic import (
     BaseModel,
     Field,
     SerializationInfo,
-    SerializerFunctionWrapHandler,
     field_serializer,
     field_validator,
-    model_serializer,
     model_validator,
 )
 from shortuuid import ShortUUID
@@ -587,15 +585,6 @@ class TrialConfig(BaseModel):
     @property
     def is_regrade(self) -> bool:
         return self.source_trial is not None
-
-    @model_serializer(mode="wrap")
-    def _omit_agent_for_seats(self, handler: SerializerFunctionWrapHandler):
-        """A seat trial runs its participants, never ``agent``, so its records
-        leave ``agent`` out rather than name a harness that did not run."""
-        data = handler(self)
-        if self.participants:
-            data.pop("agent", None)
-        return data
 
     @field_validator("participants")
     @classmethod

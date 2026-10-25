@@ -1,4 +1,3 @@
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -72,15 +71,6 @@ def test_two_participants_for_one_seat_are_refused(model):
 def test_per_agent_run_settings_are_refused_on_a_participant(field, value):
     with pytest.raises(ValidationError, match=f"sets {field}"):
         Participant(seat="maya", name="nop", **{field: value})
-
-
-def test_seat_trial_records_leave_out_the_unused_agent():
-    config = _trial_config(participants=ROSTER)
-
-    assert "agent" not in config.model_dump()
-    assert "agent" not in json.loads(config.model_dump_json())
-    assert "agent" in _trial_config().model_dump()
-    assert TrialConfig.model_validate_json(config.model_dump_json()) == config
 
 
 def test_empty_participants_leave_dumps_unchanged():
