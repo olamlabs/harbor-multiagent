@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import override
 
 from harbor.environments.base import BaseEnvironment, ExecResult
-from harbor.environments.capabilities import EnvironmentCapabilities
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import TrialPaths
 
@@ -47,11 +46,6 @@ class SeatEnvironment(BaseEnvironment):
     @override
     def type() -> str:
         return "seat"
-
-    @property
-    @override
-    def capabilities(self) -> EnvironmentCapabilities:
-        return EnvironmentCapabilities()
 
     @override
     def _validate_definition(self):
