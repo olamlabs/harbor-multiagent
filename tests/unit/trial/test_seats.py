@@ -310,10 +310,7 @@ async def test_play_ends_when_agents_under_test_end_and_the_rest_are_stopped(
     assert result.verifier_result is not None
     assert result.verifier_result.rewards == {"maya": 1}
     seats = _seat_results(result)
-    assert seats["lee"].ended_by_play_end is True
     assert seats["lee"].exception_info is None
-    assert not seats["maya"].ended_by_play_end
-    assert not seats["raj"].ended_by_play_end
     assert seats["maya"].agent_result.cost_usd == 0.5
     assert result.compute_token_cost_totals()[3] == 1.0
 
@@ -338,7 +335,6 @@ async def test_a_cancelled_trial_stays_cancelled_over_seat_errors(tmp_path: Path
     assert trial.result.exception_info is not None
     assert trial.result.exception_info.exception_type == "CancelledError"
     assert not _verified(trial)
-    assert not any(seat.result.ended_by_play_end for seat in trial.seats)
 
 
 async def test_every_seat_gets_its_own_instruction(tmp_path: Path):
@@ -415,7 +411,6 @@ async def test_play_clock_ends_everyone_still_running_and_still_grades(
     for seat in ("maya", "lee"):
         info = seats[seat].exception_info
         assert info is not None and info.exception_type == "AgentTimeoutError"
-        assert seats[seat].ended_by_play_end is True
     assert result.exception_info is not None
     assert result.exception_info.exception_type == "AgentTimeoutError"
     assert result.exception_info.exception_message.startswith("Seat 'maya': ")
@@ -471,7 +466,6 @@ async def test_a_seat_crash_fails_the_trial_and_ends_play(tmp_path: Path):
     assert ("stopped", "maya") in EVENTS and ("stopped", "raj") in EVENTS
     assert not _verified(trial)
     assert EVENTS[-1] == ("stop",)
-    assert not any(seat.ended_by_play_end for seat in result.seat_results or [])
 
 
 async def test_a_failed_log_download_warns_and_continues(

@@ -82,14 +82,6 @@ class SeatResult(BaseModel):
     agent_setup: TimingInfo | None = None
     agent_execution: TimingInfo | None = None
     exception_info: ExceptionInfo | None = None
-    ended_by_play_end: bool = Field(
-        default=False,
-        description=(
-            "The agent was still running when play ended, because every agent "
-            "under test had ended or the agent timeout ran out; false when the "
-            "trial aborted."
-        ),
-    )
 
 
 class TrialResult(BaseModel):

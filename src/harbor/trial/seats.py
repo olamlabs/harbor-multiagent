@@ -294,8 +294,7 @@ class SeatsTrial(SingleStepTrial):
         still going are then cancelled, as Trial cancels a single agent at its
         timeout. Nothing in the containers is killed, and they stay up. A seat
         error other than its agent exiting non-zero aborts play and fails the
-        trial, as it fails a single-agent trial; aborted seats are not marked
-        ended_by_play_end."""
+        trial, as it fails a single-agent trial."""
         loop = asyncio.get_running_loop()
         clock = self._agent_timeout_sec
         deadline = None if clock is None else loop.time() + clock
@@ -322,7 +321,6 @@ class SeatsTrial(SingleStepTrial):
             for seat in self.seats:
                 if tasks[seat.name].done():
                     continue
-                seat.result.ended_by_play_end = True
                 if clock_expired:
                     seat.result.exception_info = ExceptionInfo(
                         exception_type=AgentTimeoutError.__name__,
