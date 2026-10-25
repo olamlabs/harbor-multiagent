@@ -2095,6 +2095,15 @@ class _GKEDinDCompose(DinDComposeOps):
 
         self._use_prebuilt = not force_build and bool(env.task_env_config.docker_image)
 
+        docker_config_path = env._kwargs.get("docker_config_path")
+        if docker_config_path:
+            # A registry login for private images, as the local docker
+            # environment inherits one from the host's ~/.docker/config.json.
+            await self._host_exec("mkdir -p /root/.docker", timeout_sec=10)
+            await self._stage_file_to_host(
+                docker_config_path, "/root/.docker/config.json"
+            )
+
         env.logger.debug("Building compose services inside DinD pod...")
         result = await self._compose_exec(
             ["build"], timeout_sec=round(env.task_env_config.build_timeout_sec)
@@ -2106,7 +2115,10 @@ class _GKEDinDCompose(DinDComposeOps):
 
         env.logger.debug("Starting compose services inside DinD pod...")
         result = await self._compose_exec(
-            ["up", "-d"], timeout_sec=self._COMPOSE_UP_TIMEOUT_SEC
+            ["up", "-d"],
+            timeout_sec=int(
+                env._kwargs.get("compose_up_timeout_sec", self._COMPOSE_UP_TIMEOUT_SEC)
+            ),
         )
         if result.return_code != 0:
             raise RuntimeError(

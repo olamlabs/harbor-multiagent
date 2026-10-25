@@ -1230,8 +1230,9 @@ def _make_gke_compose_env(
     defaults.update(env_config_kwargs)
 
     extra = {}
-    if "dind_image" in defaults:
-        extra["dind_image"] = defaults.pop("dind_image")
+    for kwarg in ("dind_image", "compose_up_timeout_sec", "docker_config_path"):
+        if kwarg in defaults:
+            extra[kwarg] = defaults.pop(kwarg)
 
     return GKEEnvironment(
         environment_dir=env_dir,
@@ -1330,6 +1331,11 @@ class TestGKEDinDPodSpec:
         env = _make_gke_compose_env(temp_dir, dind_image="docker:27-dind")
         pod = env._dind._build_pod()
         assert pod.spec.containers[0].image == "docker:27-dind"
+
+    def test_compose_up_timeout_kwarg(self, temp_dir):
+        env = _make_gke_compose_env(temp_dir, compose_up_timeout_sec=900)
+        assert env._kwargs["compose_up_timeout_sec"] == 900
+        assert "compose_up_timeout_sec" not in _make_gke_compose_env(temp_dir)._kwargs
 
     def test_long_label_values_are_sanitized(self, temp_dir):
         env = _make_gke_compose_env(temp_dir, suffix=f".{'long_' * 15}")
