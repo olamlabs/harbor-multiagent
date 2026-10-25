@@ -101,24 +101,3 @@ class TestCodexInstall:
         assert exec_as_agent.await_args.kwargs["env"] == {
             "NVM_NODEJS_ORG_MIRROR": "https://nodejs.org/dist"
         }
-
-    @pytest.mark.asyncio
-    async def test_install_uses_existing_npm_before_nvm(self, temp_dir):
-        """An image that already ships npm installs Codex from npm directly; the
-        nvm download from GitHub is the fallback for images without Node."""
-        agent = Codex(logs_dir=temp_dir)
-        environment = AsyncMock()
-        environment.exec.return_value = AsyncMock(return_code=1, stdout="", stderr="")
-
-        exec_as_agent = AsyncMock()
-        agent.exec_as_root = cast(Any, AsyncMock())
-        agent.exec_as_agent = cast(Any, exec_as_agent)
-        agent.ensure_system_dependencies = cast(Any, AsyncMock())
-
-        await agent.install(environment)
-
-        command = exec_as_agent.await_args.kwargs["command"]
-        npm_branch, nvm_branch = command.split(" else", 1)
-        assert "command -v npm" in npm_branch
-        assert "npm install -g @openai/codex@latest" in npm_branch
-        assert "nvm-sh/nvm" in nvm_branch

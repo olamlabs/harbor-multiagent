@@ -664,8 +664,7 @@ class Codex(BaseInstalledAgent, ACPAgentMixin):
             environment,
             command=(
                 "set -euo pipefail; "
-                "if command -v npm >/dev/null 2>&1"
-                " || ldd --version 2>&1 | grep -qi musl || [ -f /etc/alpine-release ]; then"
+                "if ldd --version 2>&1 | grep -qi musl || [ -f /etc/alpine-release ]; then"
                 f"  npm install -g @openai/codex{version_spec};"
                 " else"
                 "  curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash &&"
