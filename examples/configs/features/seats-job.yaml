@@ -12,9 +12,11 @@ participants:
     name: codex
     model_name: openai/gpt-5.5
     model_api_key_name: OPENAI_API_KEY
+    kwargs: {disable_web_search: true}
   - seat: p2
     name: codex
     model_name: openai/gpt-5.5
     model_api_key_name: OPENAI_API_KEY
+    kwargs: {disable_web_search: true}
 tasks:
   - path: examples/tasks/hello-seats
