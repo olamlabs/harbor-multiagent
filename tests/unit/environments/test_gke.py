@@ -9,6 +9,7 @@ task_env_config.gpus > 0 or task_env_config.tpu is not None.
 import asyncio
 import json
 import re
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -506,15 +507,13 @@ class TestGKEExecStream:
         with pytest.raises(GKEExecStreamClosedError):
             await dind._compose_exec(["exec", "-T", "main", "true"])
 
-    async def test_compose_exec_times_out_and_kills_the_command(self, gke_env):
+    async def test_compose_exec_times_out_while_polling(self, gke_env):
         from harbor.environments.base import ExecResult
 
         dind = gke_module._GKEDinDCompose(gke_env)
-        commands: list[str] = []
 
         async def _fake_pod_exec(command, timeout_sec=None):
-            commands.append(command)
-            if ".status" in command and "while" in command:
+            if "while" in command:
                 await asyncio.sleep(0.2)
             return ExecResult(stdout="", return_code=0)
 
@@ -524,7 +523,48 @@ class TestGKEExecStream:
 
         assert result.return_code == 124
         assert result.stderr == "Command timed out after 1 seconds"
-        assert "kill -TERM -$(cat" in commands[-1]
+
+    @pytest.mark.parametrize("blocked_step", ["setsid", "rm -f"])
+    async def test_compose_exec_deadline_covers_launch_and_output(
+        self, gke_env, monkeypatch, blocked_step
+    ):
+        def _fake_stream(*args, **kwargs):
+            return MagicMock(returncode=0, command=kwargs["command"][-1])
+
+        def _fake_read_exec_output(resp):
+            if blocked_step in resp.command:
+                time.sleep(3)
+            return ("0\n" if "while" in resp.command else "", "")
+
+        monkeypatch.setattr(gke_module, "stream", _fake_stream)
+        gke_env._ensure_client = AsyncMock()
+        gke_env._core_api = MagicMock(spec=k8s_client.CoreV1Api)
+        gke_env._read_exec_output = _fake_read_exec_output
+        dind = gke_module._GKEDinDCompose(gke_env)
+
+        started = time.monotonic()
+        result = await dind._compose_exec(["build"], timeout_sec=1)
+
+        assert time.monotonic() - started < 2
+        assert result.return_code == 124
+        assert result.stderr == "Command timed out after 1 seconds"
+
+    async def test_compose_exec_fails_on_consecutive_nonzero_polls(self, gke_env):
+        from harbor.environments.base import ExecResult
+
+        dind = gke_module._GKEDinDCompose(gke_env)
+        killed = ExecResult(stderr="poll killed", return_code=137)
+        dind._pod_exec = AsyncMock(
+            side_effect=[
+                ExecResult(return_code=0),
+                *[killed] * 6,
+                ExecResult(stdout="0\n", return_code=0),
+                ExecResult(stdout="done", return_code=0),
+            ]
+        )
+
+        with pytest.raises(RuntimeError, match="exit code 137: poll killed"):
+            await dind._compose_exec(["exec", "-T", "main", "true"])
 
 
 @pytest.fixture
