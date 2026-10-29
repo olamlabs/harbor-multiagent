@@ -1668,7 +1668,7 @@ class _GKEDinDCompose(DinDComposeOps):
     # ── Low-level pod exec / tar transfer against the dind container ──────
 
     async def _pod_exec(
-        self, command: str, timeout_sec: int | None = None
+        self, command: str, timeout_sec: float | None = None
     ) -> ExecResult:
         """Run ``sh -c command`` in the dind (Alpine) container of the pod."""
         env = self._env
