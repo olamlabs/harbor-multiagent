@@ -6,8 +6,10 @@ requests/limits, node selectors, tolerations) when
 task_env_config.gpus > 0 or task_env_config.tpu is not None.
 """
 
+import asyncio
 import json
 import re
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -452,6 +454,121 @@ class TestGKEExecStream:
             await dind._pod_exec("sleep 600")
 
         response.close.assert_called_once_with()
+
+    async def test_compose_exec_runs_detached_and_reads_status_files(self, gke_env):
+        from harbor.environments.base import ExecResult
+
+        dind = gke_module._GKEDinDCompose(gke_env)
+        dind._pod_exec = AsyncMock(
+            side_effect=[
+                ExecResult(return_code=0),
+                ExecResult(stdout="17\n", return_code=0),
+                ExecResult(stdout="out", stderr="err", return_code=0),
+            ]
+        )
+
+        result = await dind._compose_exec(["exec", "-T", "main", "true"])
+
+        assert (result.return_code, result.stdout, result.stderr) == (17, "out", "err")
+        start, poll, read = (c.args[0] for c in dind._pod_exec.await_args_list)
+        assert "setsid sh -c" in start
+        assert "docker compose" in start
+        assert ".status" in poll
+        assert "rm -f" in read
+
+    async def test_compose_exec_survives_a_closed_poll_stream(self, gke_env):
+        from harbor.environments.base import ExecResult
+
+        dind = gke_module._GKEDinDCompose(gke_env)
+        dind._pod_exec = AsyncMock(
+            side_effect=[
+                ExecResult(return_code=0),
+                GKEExecStreamClosedError("Kubernetes exec stream receive failed"),
+                ExecResult(stdout="0\n", return_code=0),
+                ExecResult(stdout="done", stderr="", return_code=0),
+            ]
+        )
+
+        result = await dind._compose_exec(["exec", "-T", "main", "true"])
+
+        assert result.return_code == 0
+        assert result.stdout == "done"
+
+    async def test_compose_exec_raises_after_consecutive_closed_polls(self, gke_env):
+        from harbor.environments.base import ExecResult
+
+        dind = gke_module._GKEDinDCompose(gke_env)
+        dind._STATUS_POLL_FAILURE_LIMIT = 2
+        closed = GKEExecStreamClosedError("Kubernetes exec stream receive failed")
+        dind._pod_exec = AsyncMock(
+            side_effect=[ExecResult(return_code=0), closed, closed]
+        )
+
+        with pytest.raises(GKEExecStreamClosedError):
+            await dind._compose_exec(["exec", "-T", "main", "true"])
+
+    async def test_compose_exec_times_out_while_polling(self, gke_env):
+        from harbor.environments.base import ExecResult
+
+        dind = gke_module._GKEDinDCompose(gke_env)
+
+        async def _fake_pod_exec(command, timeout_sec=None):
+            if "while" in command:
+                await asyncio.sleep(0.2)
+            return ExecResult(stdout="", return_code=0)
+
+        dind._pod_exec = _fake_pod_exec
+
+        result = await dind._compose_exec(["up", "-d"], timeout_sec=1)
+
+        assert result.return_code == 124
+        assert result.stderr == "Command timed out after 1 seconds"
+
+    @pytest.mark.parametrize("blocked_call", ["stream", "read"])
+    @pytest.mark.parametrize("blocked_step", ["setsid", "while", "rm -f"])
+    async def test_compose_exec_deadline_covers_every_step(
+        self, gke_env, monkeypatch, blocked_call, blocked_step
+    ):
+        def _fake_stream(*args, **kwargs):
+            command = kwargs["command"][-1]
+            if blocked_call == "stream" and blocked_step in command:
+                time.sleep(3)
+            return MagicMock(returncode=0, command=command)
+
+        def _fake_read_exec_output(resp):
+            if blocked_call == "read" and blocked_step in resp.command:
+                time.sleep(3)
+            return ("0\n" if "while" in resp.command else "", "")
+
+        monkeypatch.setattr(gke_module, "stream", _fake_stream)
+        gke_env._ensure_client = AsyncMock()
+        gke_env._core_api = MagicMock(spec=k8s_client.CoreV1Api)
+        gke_env._read_exec_output = _fake_read_exec_output
+        dind = gke_module._GKEDinDCompose(gke_env)
+
+        started = time.monotonic()
+        result = await dind._compose_exec(["build"], timeout_sec=1)
+
+        assert time.monotonic() - started < 2
+        assert result.return_code == 124
+        assert result.stderr == "Command timed out after 1 seconds"
+
+    async def test_compose_exec_fails_on_consecutive_nonzero_polls(self, gke_env):
+        from harbor.environments.base import ExecResult
+
+        dind = gke_module._GKEDinDCompose(gke_env)
+        killed = ExecResult(stderr="poll killed", return_code=137)
+        dind._pod_exec = AsyncMock(
+            side_effect=[
+                ExecResult(return_code=0),
+                *[killed] * 6,
+                ExecResult(stdout="0\n", return_code=0),
+                ExecResult(stdout="done", return_code=0),
+            ]
+        )
+
+        with pytest.raises(RuntimeError, match="exit code 137: poll killed"):
+            await dind._compose_exec(["exec", "-T", "main", "true"])
 
 
 @pytest.fixture
