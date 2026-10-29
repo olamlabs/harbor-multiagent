@@ -13,6 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, override
+from uuid import uuid4
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -1629,6 +1630,9 @@ class _GKEDinDCompose(DinDComposeOps):
     _DIND_CONTAINER = "dind"
     _COMPOSE_UP_TIMEOUT_SEC = 120
     _MAIN_CONTAINER_TIMEOUT_SEC = 60
+    _DETACHED_EXEC_DIR = "/harbor/exec"
+    _POLL_WAIT_SEC = 10
+    _STATUS_POLL_FAILURE_LIMIT = 5
 
     def __init__(self, env: "GKEEnvironment"):
         self._env = env
@@ -1924,7 +1928,82 @@ class _GKEDinDCompose(DinDComposeOps):
         prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env_vars.items())
         command = self._compose_cmd(subcommand)
         full = f"{prefix} {command}" if prefix else command
-        return await self._pod_exec(full, timeout_sec=timeout_sec)
+        return await self._detached_pod_exec(full, timeout_sec=timeout_sec)
+
+    async def _detached_pod_exec(
+        self, command: str, timeout_sec: int | None = None
+    ) -> ExecResult:
+        """Run ``command`` detached in the dind container and poll its status.
+
+        A Kubernetes exec stream is tunnelled through a ``konnectivity-agent``
+        pod, and GKE deletes those pods when it scales the cluster's nodes
+        down, which closes every stream they carry. Holding one stream for a
+        command that runs for hours (an agent's turn, a large ``compose up``)
+        loses the command. Here the command writes its output and exit status
+        to files in the dind container, and each poll is a short exec of its
+        own, so a closed stream costs one poll. This is the pattern of the EC2
+        environment's detached exec.
+        """
+        base = f"{self._DETACHED_EXEC_DIR}/{uuid4().hex}"
+        stdout_path, stderr_path, status_path, pid_path = (
+            shlex.quote(f"{base}.{suffix}")
+            for suffix in ("stdout", "stderr", "status", "pid")
+        )
+        wrapper = (
+            f"({command}) > {stdout_path} 2> {stderr_path}; "
+            f"echo $? > {status_path}.tmp && mv {status_path}.tmp {status_path}"
+        )
+        start = await self._pod_exec(
+            f"mkdir -p {self._DETACHED_EXEC_DIR} && {{ "
+            f"setsid sh -c {shlex.quote(wrapper)} < /dev/null > /dev/null 2>&1 & "
+            f"echo $! > {pid_path}; }}"
+        )
+        if start.return_code != 0:
+            return start
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_sec if timeout_sec else None
+        consecutive_failures = 0
+        while True:
+            remaining = None if deadline is None else max(0, deadline - loop.time())
+            wait_sec = (
+                self._POLL_WAIT_SEC
+                if remaining is None
+                else min(self._POLL_WAIT_SEC, remaining)
+            )
+            try:
+                poll = await self._pod_exec(
+                    f"i=0; while [ ! -e {status_path} ] && [ $i -lt {int(wait_sec * 5)} ]; "
+                    f"do sleep 0.2; i=$((i+1)); done; cat {status_path} 2>/dev/null || true",
+                    timeout_sec=None if remaining is None else max(1, int(remaining)),
+                )
+                consecutive_failures = 0
+            except GKEExecStreamClosedError:
+                consecutive_failures += 1
+                if consecutive_failures >= self._STATUS_POLL_FAILURE_LIMIT:
+                    raise
+                continue
+            status = (poll.stdout or "").strip()
+            if status:
+                break
+            if deadline is not None and loop.time() >= deadline:
+                await self._pod_exec(
+                    f"kill -TERM -$(cat {pid_path}) 2>/dev/null; rm -f {base}.*"
+                )
+                return ExecResult(
+                    stdout=None,
+                    stderr=f"Command timed out after {timeout_sec} seconds",
+                    return_code=124,
+                )
+
+        output = await self._pod_exec(
+            f"cat {stdout_path}; cat {stderr_path} >&2; rm -f {base}.*"
+        )
+        return ExecResult(
+            stdout=output.stdout,
+            stderr=output.stderr,
+            return_code=int(status),
+        )
 
     async def _stage_resources_compose_file(self) -> None:
         """Write the resources override locally and upload it to the pod.
