@@ -524,15 +524,19 @@ class TestGKEExecStream:
         assert result.return_code == 124
         assert result.stderr == "Command timed out after 1 seconds"
 
-    @pytest.mark.parametrize("blocked_step", ["setsid", "rm -f"])
-    async def test_compose_exec_deadline_covers_launch_and_output(
-        self, gke_env, monkeypatch, blocked_step
+    @pytest.mark.parametrize("blocked_call", ["stream", "read"])
+    @pytest.mark.parametrize("blocked_step", ["setsid", "while", "rm -f"])
+    async def test_compose_exec_deadline_covers_every_step(
+        self, gke_env, monkeypatch, blocked_call, blocked_step
     ):
         def _fake_stream(*args, **kwargs):
-            return MagicMock(returncode=0, command=kwargs["command"][-1])
+            command = kwargs["command"][-1]
+            if blocked_call == "stream" and blocked_step in command:
+                time.sleep(3)
+            return MagicMock(returncode=0, command=command)
 
         def _fake_read_exec_output(resp):
-            if blocked_step in resp.command:
+            if blocked_call == "read" and blocked_step in resp.command:
                 time.sleep(3)
             return ("0\n" if "while" in resp.command else "", "")
 

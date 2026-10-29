@@ -1668,7 +1668,7 @@ class _GKEDinDCompose(DinDComposeOps):
     # ── Low-level pod exec / tar transfer against the dind container ──────
 
     async def _pod_exec(
-        self, command: str, timeout_sec: float | None = None
+        self, command: str, timeout_sec: int | None = None
     ) -> ExecResult:
         """Run ``sh -c command`` in the dind (Alpine) container of the pod."""
         env = self._env
@@ -1942,8 +1942,8 @@ class _GKEDinDCompose(DinDComposeOps):
         loses the command. Here the command writes its output and exit status
         to files in the dind container, and each poll is a short exec of its
         own, so a closed stream costs one poll. This is the pattern of the EC2
-        environment's detached exec. ``timeout_sec`` bounds the whole
-        operation: launch, polls and reading the output.
+        environment's detached exec. ``timeout_sec`` is one deadline over
+        the whole operation, opening each exec stream included.
         """
         base = f"{self._DETACHED_EXEC_DIR}/{uuid4().hex}"
         stdout_path, stderr_path, status_path, pid_path = (
@@ -1956,69 +1956,57 @@ class _GKEDinDCompose(DinDComposeOps):
         )
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_sec if timeout_sec else None
-        timed_out = ExecResult(
-            stdout=None,
-            stderr=f"Command timed out after {timeout_sec} seconds",
-            return_code=124,
-        )
-
-        async def pod_exec_before_deadline(step: str) -> ExecResult | None:
-            if deadline is None:
-                return await self._pod_exec(step)
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return None
-            result = await self._pod_exec(step, timeout_sec=remaining)
-            if result.return_code == 124 and loop.time() >= deadline:
-                return None
-            return result
-
-        start = await pod_exec_before_deadline(
-            f"mkdir -p {self._DETACHED_EXEC_DIR} && {{ "
-            f"setsid sh -c {shlex.quote(wrapper)} < /dev/null > /dev/null 2>&1 & "
-            f"echo $! > {pid_path}; }}"
-        )
-        if start is None:
-            return timed_out
-        if start.return_code != 0:
-            return start
-
-        consecutive_failures = 0
-        while True:
-            wait_sec = self._POLL_WAIT_SEC
-            if deadline is not None:
-                wait_sec = min(wait_sec, max(0, deadline - loop.time()))
-            try:
-                poll = await pod_exec_before_deadline(
-                    f"i=0; while [ ! -e {status_path} ] && [ $i -lt {int(wait_sec * 5)} ]; "
-                    f"do sleep 0.2; i=$((i+1)); done; cat {status_path} 2>/dev/null || true"
+        scope = asyncio.timeout_at(deadline)
+        try:
+            async with scope:
+                start = await self._pod_exec(
+                    f"mkdir -p {self._DETACHED_EXEC_DIR} && {{ "
+                    f"setsid sh -c {shlex.quote(wrapper)} < /dev/null > /dev/null 2>&1 & "
+                    f"echo $! > {pid_path}; }}"
                 )
-            except GKEExecStreamClosedError:
-                consecutive_failures += 1
-                if consecutive_failures >= self._STATUS_POLL_FAILURE_LIMIT:
-                    raise
-                continue
-            if poll is None:
-                return timed_out
-            if poll.return_code != 0:
-                consecutive_failures += 1
-                if consecutive_failures >= self._STATUS_POLL_FAILURE_LIMIT:
-                    raise RuntimeError(
-                        f"Status poll of a detached command failed "
-                        f"{consecutive_failures} times in a row, last with exit "
-                        f"code {poll.return_code}: {poll.stderr or poll.stdout}"
-                    )
-                continue
-            consecutive_failures = 0
-            status = (poll.stdout or "").strip()
-            if status:
-                break
+                if start.return_code != 0:
+                    return start
 
-        output = await pod_exec_before_deadline(
-            f"cat {stdout_path}; cat {stderr_path} >&2; rm -f {base}.*"
-        )
-        if output is None:
-            return timed_out
+                consecutive_failures = 0
+                while True:
+                    wait_sec = self._POLL_WAIT_SEC
+                    if deadline is not None:
+                        wait_sec = min(wait_sec, max(0, deadline - loop.time()))
+                    try:
+                        poll = await self._pod_exec(
+                            f"i=0; while [ ! -e {status_path} ] && [ $i -lt {int(wait_sec * 5)} ]; "
+                            f"do sleep 0.2; i=$((i+1)); done; cat {status_path} 2>/dev/null || true"
+                        )
+                    except GKEExecStreamClosedError:
+                        consecutive_failures += 1
+                        if consecutive_failures >= self._STATUS_POLL_FAILURE_LIMIT:
+                            raise
+                        continue
+                    if poll.return_code != 0:
+                        consecutive_failures += 1
+                        if consecutive_failures >= self._STATUS_POLL_FAILURE_LIMIT:
+                            raise RuntimeError(
+                                f"Status poll of a detached command failed "
+                                f"{consecutive_failures} times in a row, last with exit "
+                                f"code {poll.return_code}: {poll.stderr or poll.stdout}"
+                            )
+                        continue
+                    consecutive_failures = 0
+                    status = (poll.stdout or "").strip()
+                    if status:
+                        break
+
+                output = await self._pod_exec(
+                    f"cat {stdout_path}; cat {stderr_path} >&2; rm -f {base}.*"
+                )
+        except TimeoutError:
+            if not scope.expired():
+                raise
+            return ExecResult(
+                stdout=None,
+                stderr=f"Command timed out after {timeout_sec} seconds",
+                return_code=124,
+            )
         return ExecResult(
             stdout=output.stdout,
             stderr=output.stderr,
