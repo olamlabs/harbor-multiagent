@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -1932,6 +1933,10 @@ def local_ssh_dind(temp_dir, tmp_path, monkeypatch):
     dind._ssh_keys.cleanup()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the local ssh stand-in is a POSIX shell script",
+)
 class TestGKEDinDSSHTransfers:
     """Bytes, exit codes and deadlines through the SSH subprocess."""
 
