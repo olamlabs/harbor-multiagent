@@ -75,9 +75,7 @@ def persist_trajectory(tmp_path):
 
     def persist(events):
         events_path = tmp_path / "acp-events.jsonl"
-        events_path.write_text(
-            "".join(json.dumps(event) + "\n" for event in events)
-        )
+        events_path.write_text("".join(json.dumps(event) + "\n" for event in events))
         original_events = events_path.read_bytes()
         context = AgentContext()
         agent.populate_context_post_run(context)
