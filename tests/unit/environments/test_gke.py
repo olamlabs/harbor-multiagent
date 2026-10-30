@@ -1992,6 +1992,7 @@ class TestGKEDinDSSHTransfers:
             )
 
     async def test_pod_exec_deadline_stops_the_ssh_process(self, local_ssh_dind):
+        local_ssh_dind._ssh_command = lambda command: ["sleep", "5"]
         started = time.monotonic()
         result = await local_ssh_dind._pod_exec("sleep 5", timeout_sec=0.3)
 
