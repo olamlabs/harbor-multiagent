@@ -1405,7 +1405,7 @@ rm -f "$tmp_archive"
                 tool_state.observation_chunks.append(observation_text)
 
             tool_state.raw_updates.append(update)
-            if update.get("status") == "completed":
+            if update.get("status") in ("completed", "failed"):
                 step_state.has_completed_tool_cycle = True
 
         _flush_current_step()
