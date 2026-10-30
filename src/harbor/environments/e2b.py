@@ -4,14 +4,18 @@ import asyncio
 import contextlib
 import hashlib
 import math
+import re
+import shlex
+import stat
+import tempfile
 import time
 import warnings
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, override
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from tenacity import (
     RetryCallState,
@@ -38,6 +42,13 @@ from harbor.environments.definition import (
     require_agent_environment_definition,
     should_upload_environment_dir,
 )
+from harbor.environments.tar_transfer import (
+    extract_dir_from_file,
+    pack_dir_to_bytes,
+    remote_pack_command,
+    remote_unpack_command,
+    tar_pack_succeeded,
+)
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.models.trial.paths import TrialPaths
@@ -54,13 +65,13 @@ try:
     )
     from e2b.exceptions import (
         BuildException,
+        FileNotFoundException,
         RateLimitException,
         SandboxException,
         ServiceBusyException,
         TemplateException,
     )
     from e2b.sandbox.commands.command_handle import CommandExitException
-    from e2b.sandbox.filesystem.filesystem import WriteEntry
     from e2b.sandbox.sandbox_api import SandboxNetworkUpdate
     from e2b.sandbox_async.commands.command_handle import AsyncCommandHandle
     from e2b.template.types import BuildInfo, LogEntry, TemplateBuildStatus
@@ -265,13 +276,189 @@ def _is_build_conflict(exc: BaseException) -> bool:
     return isinstance(exc, BuildException) and str(exc).startswith("409:")
 
 
+# Timeouts for the commands file transfers run. commands.run defaults to 60 s,
+# too short to pack or unpack a large tree.
+_TAR_TIMEOUT_SEC = 600
+_CHMOD_TIMEOUT_SEC = 60
+_CLEANUP_TIMEOUT_SEC = 30
+
+
+LOGIN_PATH_DROPIN_PATH = "/etc/profile.d/00-harbor-e2b-path.sh"
+
+# E2B runs every command through ``bash -l -c``. Debian, Ubuntu, and Alpine
+# ``/etc/profile`` assign PATH unconditionally for login shells, which drops
+# entries the image environment or the caller supplied (a conda env, a Go
+# toolchain, a venv). ``docker exec`` never runs a login shell, so those
+# entries survive there. This drop-in runs after that assignment, reads the
+# PATH the shell was started with from its own initial environment, and
+# restores it. Per-command ``envs`` overrides are part of that initial
+# environment, so they win too.
+#
+# Cost: three short-lived processes (tr, sed, head) per login shell, so per
+# command. It also applies to login shells an agent starts itself: a nested
+# ``bash -l`` keeps the PATH it inherited instead of the one /etc/profile
+# would set. ``restore_login_path=False`` removes it.
+LOGIN_PATH_DROPIN = """\
+# Installed by Harbor's E2B environment. Restore the PATH this login shell was
+# started with; /etc/profile replaced it above. Docker exec does not run a
+# login shell, so this keeps image and per-command PATH entries intact.
+_harbor_e2b_path=$(tr '\\0' '\\n' < /proc/$$/environ 2>/dev/null | sed -n 's/^PATH=//p' | head -n 1)
+if [ -n "$_harbor_e2b_path" ]; then
+    export PATH="$_harbor_e2b_path"
+fi
+unset _harbor_e2b_path
+"""
+
+
+# E2B does not carry the image's config ENV, nor Dockerfile ENV, into commands
+# run in the sandbox (verified: only E2B_* plus HOME/USER/LOGNAME/PATH/PWD reach
+# ``commands.run``), and it cannot see the image config's USER. Build-time RUN
+# steps do see both ENV sources and run as the final build user. So the
+# template records its own runtime environment and user while it is built,
+# and the environment reads them back once per sandbox: the environment is
+# applied to every command at the lowest precedence, under task, trial, and
+# per-command values, and the user is the default exec user.
+IMAGE_CAPTURE_DIR = "/var/lib/harbor"
+IMAGE_ENV_CAPTURE_PATH = f"{IMAGE_CAPTURE_DIR}/image-env"
+IMAGE_USER_CAPTURE_PATH = f"{IMAGE_CAPTURE_DIR}/image-user"
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+# Values that describe the build-time process rather than the image, unless the
+# Dockerfile sets them with ``ENV``.
+_IMAGE_ENV_EXCLUDE = frozenset(
+    {"HOME", "USER", "LOGNAME", "PWD", "OLDPWD", "SHLVL", "SHELL", "PS1", "TERM", "_"}
+)
+
+
+def _instruction_keys(instruction: str, value: str) -> list[str]:
+    """Variable names an ``ARG`` or ``ENV`` instruction declares."""
+    try:
+        tokens = shlex.split(value)
+    except ValueError:
+        tokens = value.split()
+    if not tokens:
+        return []
+    if instruction == "ENV" and "=" not in tokens[0]:
+        return [tokens[0]]  # legacy ``ENV KEY value with spaces``
+    return [
+        token.split("=", 1)[0]
+        for token in tokens
+        if instruction == "ARG" or "=" in token
+    ]
+
+
+def _dockerfile_arg_and_env_names(
+    dockerfile_path: Path,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Names a Dockerfile declares with ``ARG`` and with ``ENV``."""
+    if not dockerfile_path.exists():
+        return frozenset(), frozenset()
+    from dockerfile_parse import DockerfileParser
+
+    args: set[str] = set()
+    envs: set[str] = set()
+    for instruction in DockerfileParser(path=str(dockerfile_path)).structure:
+        name = instruction.get("instruction")
+        if name not in ("ARG", "ENV"):
+            continue
+        keys = _instruction_keys(name, str(instruction.get("value", "")))
+        (args if name == "ARG" else envs).update(keys)
+    return frozenset(args), frozenset(envs)
+
+
+def dockerfile_build_arg_names(dockerfile_path: Path) -> frozenset[str]:
+    """Names a Dockerfile declares with ``ARG`` and never with ``ENV``.
+
+    The E2B SDK turns ``ARG`` into build environment variables, so they show up
+    in the build-time capture; ``docker exec`` never sees them. A name the base
+    image's own config also sets is dropped too, which loses that value; set
+    it with ``ENV`` in the Dockerfile to keep it.
+    """
+    args, envs = _dockerfile_arg_and_env_names(dockerfile_path)
+    return args - envs
+
+
+def dockerfile_env_names(dockerfile_path: Path) -> frozenset[str]:
+    """Names a Dockerfile declares with ``ENV``."""
+    return _dockerfile_arg_and_env_names(dockerfile_path)[1]
+
+
+def dockerfile_sets_user(dockerfile_path: Path) -> bool:
+    """Whether the Dockerfile has a ``USER`` instruction.
+
+    The E2B SDK supports single-stage Dockerfiles only, so any ``USER`` is the
+    final stage's.
+    """
+    if not dockerfile_path.exists():
+        return False
+    from dockerfile_parse import DockerfileParser
+
+    return any(
+        instruction.get("instruction") == "USER"
+        for instruction in DockerfileParser(path=str(dockerfile_path)).structure
+    )
+
+
+def image_env_capture_command(
+    drop: frozenset[str], source: str = "/proc/$$/environ"
+) -> str:
+    """Shell command that writes the build step's starting environment, NUL-separated.
+
+    ``source`` is the shell's own environment as it started: E2B runs build
+    steps under ``bash -l``, whose profile resets PATH, so the shell's current
+    environment would lose the image's PATH. Names in ``drop`` (build-only
+    ``ARG`` values) are filtered out of that environment, not unset from the
+    current one.
+    """
+    names = sorted(name for name in drop if _ENV_NAME.fullmatch(name))
+    if not names:
+        return f"cat {source}"
+    patterns = "|".join(f"{name}=*" for name in names)
+    script = (
+        f'for kv; do case $kv in {patterns}) ;; *) printf "%s\\0" "$kv";; esac; done'
+    )
+    return f"xargs -0 sh -c {shlex.quote(script)} _ < {source}"
+
+
+def parse_image_env_capture(
+    text: str,
+    drop: frozenset[str] = frozenset(),
+    keep: frozenset[str] = frozenset(),
+) -> dict[str, str]:
+    """Parse the NUL-separated ``KEY=VALUE`` capture into a runtime env map.
+
+    Entries are split on NUL, as in ``/proc/<pid>/environ``, so values that
+    contain newlines survive. Names in ``drop`` are left out. Build-process
+    names such as ``HOME`` and ``SHELL`` are left out unless named in ``keep``
+    (the Dockerfile sets them with ``ENV``).
+    """
+    env: dict[str, str] = {}
+    for entry in text.split("\0"):
+        key, sep, value = entry.partition("=")
+        if (
+            not sep
+            or not key
+            or (key in _IMAGE_ENV_EXCLUDE and key not in keep)
+            or key in drop
+            or key.startswith("E2B_")
+        ):
+            continue
+        env[key] = value
+    return env
+
+
 # Bump when the steps this environment appends to a template change (capture
 # files, default user). Old builds then stop matching and are rebuilt rather
-# than reused without the behavior the current code expects.
-TEMPLATE_RECIPE_VERSION = "r1"
+# than reused without the behavior the current code expects. The current
+# recipe records the image environment (without build-only ARG values) and
+# user, root-owned and readable by root only, and sets the default user and
+# workdir as Docker would.
+TEMPLATE_RECIPE_VERSION = "r5"
 
 
-def _template_name(environment_id: str, docker_image: str | None) -> str:
+def _template_name(
+    environment_id: str, docker_image: str | None, image_user: str | None = None
+) -> str:
     """Template name for an environment: ``harbor-<hash>``.
 
     A template built from ``docker_image`` contains that image, but the
@@ -288,6 +475,8 @@ def _template_name(environment_id: str, docker_image: str | None) -> str:
         digest = hashlib.sha256(
             f"{environment_id}\0{docker_image}".encode()
         ).hexdigest()
+    if image_user:
+        digest = hashlib.sha256(f"{digest}\0user={image_user}".encode()).hexdigest()
     return f"harbor-{digest[:32]}"
 
 
@@ -406,7 +595,6 @@ class _BuildPollRegistry:
 
 
 class E2BEnvironment(BaseEnvironment):
-    _UPLOAD_BATCH_SIZE = 20
     _BUILD_POLL_INTERVAL_SEC: float = 2.0
     # "Not found" status answers for a build this process started before a
     # warning is logged.
@@ -417,10 +605,11 @@ class E2BEnvironment(BaseEnvironment):
     # reports as not ready.
     _READY_CREATE_ATTEMPTS = 3
 
-    # The prebuilt template is the agent's image, so a separate verifier with
-    # its own definition must not inherit it. The trial reads this through the
-    # environment interface's agent_only_kwargs hook; until then it is unused.
-    agent_only_kwargs = frozenset({"prebuilt_template_id"})
+    # The prebuilt template and the image user configure the agent's image, so
+    # a separate verifier with its own definition must not inherit them. The
+    # trial reads this through the environment interface's agent_only_kwargs
+    # hook; until then it is unused.
+    agent_only_kwargs = frozenset({"prebuilt_template_id", "image_user"})
 
     # The job this trial belongs to, set by the trial through the environment
     # interface's job_id where it supports one; None outside a job, and until
@@ -451,6 +640,9 @@ class E2BEnvironment(BaseEnvironment):
         renew_interval_sec: float = 600.0,
         max_concurrent_builds: int | None = 20,
         max_api_reads_per_sec: float | None = 20.0,
+        restore_login_path: bool = True,
+        allow_memory_overcommit: bool = True,
+        image_user: str | None = None,
         **kwargs,
     ):
         """
@@ -464,6 +656,25 @@ class E2BEnvironment(BaseEnvironment):
                 declared in ``agent_only_kwargs``, so a separate verifier with
                 its own definition does not inherit it once the trial honours
                 that hook.
+            image_user: User to run commands as when Harbor resolves none.
+                Without it that is the user the template was built as (the
+                Dockerfile's ``USER``, recorded at build), else ``root``. A
+                Dockerfile with no ``USER`` is also built as this user. Set it
+                when the base image's config sets a non-root user, which E2B
+                does not see, or for a prebuilt template.
+            restore_login_path: Install a ``/etc/profile.d`` drop-in at start
+                that restores the PATH each login shell was started with, so
+                image and per-command PATH entries survive ``/etc/profile``.
+                It runs three short processes per command and also applies to
+                login shells an agent starts. Disable only for images whose
+                profile must own PATH.
+            allow_memory_overcommit: Set ``vm.overcommit_memory=1`` at start,
+                so a large allocation the process never fully touches succeeds
+                as it does on a Docker host with ample RAM. Under the kernel's
+                default heuristic the sandbox VM refuses any single allocation
+                larger than its own memory, so such a program gets NULL (or
+                ``MemoryError``) on E2B and runs under Docker. Memory actually
+                used beyond the sandbox's limit still ends in the OOM killer.
             sandbox_timeout_sec: How long the sandbox stays alive without a
                 renewal. The sandbox is created with this timeout and the
                 timeout is renewed every ``renew_interval_sec`` seconds while the
@@ -556,6 +767,13 @@ class E2BEnvironment(BaseEnvironment):
             if prebuilt_template_id is not None
             else parse_dockerfile_workdir(self._environment_definition_path)
         )
+        self._image_user = image_user
+        # Filled from the template's build-time capture at start(). The exec
+        # base env is the image env under the task/trial startup env, merged
+        # once rather than per command.
+        self._image_env: dict[str, str] = {}
+        self._captured_user: str | None = None
+        self._exec_base_env: dict[str, str] = {}
 
         self._sandbox: AsyncSandbox | None = None
         self._sandbox_timeout_sec = sandbox_timeout_sec
@@ -563,13 +781,15 @@ class E2BEnvironment(BaseEnvironment):
         self._max_concurrent_builds = max_concurrent_builds
         self._max_api_reads_per_sec = max_api_reads_per_sec
         self._renew_task: asyncio.Task[None] | None = None
+        self._restore_login_path = restore_login_path
+        self._allow_memory_overcommit = allow_memory_overcommit
         # Identity: the template name is the environment content hash and the
         # tag is the resource variant. Sandboxes launch from the exact build ID
         # the tag resolved to, so a later rebuild cannot change a running job.
         # ``environment_name`` travels in sandbox metadata, not in the name,
         # which keeps names inside E2B's ``^[a-z0-9-_]+$`` / 128-char rule.
         self._template_name = _template_name(
-            self.environment_id, self.task_env_config.docker_image
+            self.environment_id, self.task_env_config.docker_image, self._image_user
         )
         self._template_tag = _resource_tag(self._cpu_count, self._effective_memory_mb)
         self._template_build_id: str | None = None
@@ -685,14 +905,99 @@ class E2BEnvironment(BaseEnvironment):
     def _tag_ref(self) -> str:
         return f"{self._template_name}:{self._template_tag}"
 
+    @property
+    def default_exec_user(self) -> str:
+        """User for commands when Harbor resolves none, as ``docker exec``
+        without ``-u`` would use the image's user: ``image_user`` if set, else
+        the user the template was built as, else root."""
+        return self._image_user or self._captured_user or "root"
+
     def _template_definition(self):
         if self.task_env_config.docker_image:
-            return Template().from_image(image=self.task_env_config.docker_image)
-        return Template(
-            file_context_path=str(self.environment_dir),
-        ).from_dockerfile(
-            dockerfile_content_or_path=str(self._environment_definition_path),
+            template = Template().from_image(image=self.task_env_config.docker_image)
+            sets_user = False
+        else:
+            template = Template(
+                file_context_path=str(self.environment_dir),
+            ).from_dockerfile(
+                dockerfile_content_or_path=str(self._environment_definition_path),
+            )
+            sets_user = dockerfile_sets_user(self._environment_definition_path)
+        if not sets_user:
+            # The SDK appends ``USER user`` when the Dockerfile sets no USER.
+            # Docker would keep the image's user (root when unset); do the same.
+            template = template.set_user(self._image_user or "root")
+        if self._workdir is None:
+            # Likewise the SDK appends ``WORKDIR /home/user`` when the Dockerfile
+            # sets no WORKDIR. Docker starts in the image's WorkingDir, which is
+            # ``/`` for an image whose config sets none. The image config is not
+            # visible here, so ``/`` is the closest default; a task whose base
+            # image sets WorkingDir should declare ``workdir`` in its config.
+            template = template.set_workdir("/")
+        # ARG values are visible to build steps but are not part of a Docker
+        # image's runtime environment. Remove them before writing the capture,
+        # rather than only filtering after a sandbox starts.
+        build_args = (
+            frozenset()
+            if self.task_env_config.docker_image
+            else dockerfile_build_arg_names(self._environment_definition_path)
         )
+        capture_env = image_env_capture_command(build_args)
+        # Record the environment and user the build's final user runs with, for
+        # start() to read back. The middle step runs as that user; the
+        # directory is opened for it, then handed back to root read-only so a
+        # command in the sandbox cannot change what later starts read.
+        return (
+            template.run_cmd(f"install -d -m 0777 {IMAGE_CAPTURE_DIR}", user="root")
+            .run_cmd(
+                f"{capture_env} > {IMAGE_ENV_CAPTURE_PATH}"
+                f" && {{ id -un 2>/dev/null || id -u; }} > {IMAGE_USER_CAPTURE_PATH}"
+            )
+            .run_cmd(
+                f"chown -R root:root {IMAGE_CAPTURE_DIR}"
+                f" && chmod 0755 {IMAGE_CAPTURE_DIR}"
+                f" && chmod 0600 {IMAGE_ENV_CAPTURE_PATH}"
+                f" && chmod 0644 {IMAGE_USER_CAPTURE_PATH}",
+                user="root",
+            )
+        )
+
+    async def _load_image_runtime(self, sandbox: AsyncSandbox) -> None:
+        """Read the build-time capture into ``_image_env`` / ``_captured_user``.
+
+        Every template this environment builds has the capture (the recipe
+        version in its tag guarantees that), so a missing one is an error. A
+        ``prebuilt_template_id`` template may have been built some other way;
+        without a capture its commands run with the sandbox's own environment
+        and as ``image_user`` or root.
+        """
+        try:
+            raw_env = await sandbox.files.read(
+                IMAGE_ENV_CAPTURE_PATH, format="text", user="root"
+            )
+            raw_user = await sandbox.files.read(
+                IMAGE_USER_CAPTURE_PATH, format="text", user="root"
+            )
+        except FileNotFoundException as exc:
+            if self._prebuilt_template_id is None:
+                raise RuntimeError(
+                    f"E2B template {self.template_ref} has no image capture at "
+                    f"{IMAGE_CAPTURE_DIR}, which every template Harbor builds "
+                    "records; rebuild it with force_build."
+                ) from exc
+            self.logger.info(
+                f"Prebuilt E2B template {self.template_ref} has no image capture "
+                f"at {IMAGE_CAPTURE_DIR}; commands use the sandbox's own "
+                f"environment and run as {self.default_exec_user}."
+            )
+            return
+        drop: frozenset[str] = frozenset()
+        keep: frozenset[str] = frozenset()
+        if self._prebuilt_template_id is None and not self.task_env_config.docker_image:
+            drop = dockerfile_build_arg_names(self._environment_definition_path)
+            keep = dockerfile_env_names(self._environment_definition_path)
+        self._image_env = parse_image_env_capture(raw_env, drop=drop, keep=keep)
+        self._captured_user = raw_user.strip() or None
 
     async def _resolve_tag(self) -> str | None:
         """Return the build ID the resource tag points at, or None if untagged.
@@ -1121,6 +1426,8 @@ class E2BEnvironment(BaseEnvironment):
         if self._renew_interval_sec > 0:
             self._renew_task = asyncio.create_task(self._renew_loop())
         try:
+            await self._prepare_sandbox()
+
             await self.ensure_dirs(self._mount_targets(writable_only=True))
 
             await self._upload_environment_dir_after_start()
@@ -1129,6 +1436,38 @@ class E2BEnvironment(BaseEnvironment):
                 self._renew_task.cancel()
                 self._renew_task = None
             raise
+
+    async def _prepare_sandbox(self) -> None:
+        """Make commands in the new sandbox run as they would under Docker.
+
+        Installs the login-shell PATH drop-in, allows memory overcommit, and
+        reads the image environment and user recorded at build.
+        """
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+        if self._restore_login_path:
+            await self._sandbox.files.write(
+                LOGIN_PATH_DROPIN_PATH, LOGIN_PATH_DROPIN, user="root"
+            )
+        if self._allow_memory_overcommit:
+            try:
+                await self._sandbox.commands.run(
+                    "sysctl -qw vm.overcommit_memory=1",
+                    user="root",
+                    cwd="/",
+                    timeout=30,
+                )
+            except (CommandExitException, SandboxException) as exc:
+                # Optional: a refusal, timeout or transport failure leaves the
+                # kernel default; the trial still runs.
+                detail = (
+                    exc.stderr.strip()
+                    if isinstance(exc, CommandExitException)
+                    else f"{type(exc).__name__}: {exc}"
+                )
+                self.logger.warning(f"Could not allow memory overcommit: {detail}")
+        await self._load_image_runtime(self._sandbox)
+        self._exec_base_env = {**self._image_env, **self._startup_env()}
 
     async def _renew_loop(self) -> None:
         while True:
@@ -1173,6 +1512,27 @@ class E2BEnvironment(BaseEnvironment):
         else:
             self.logger.debug("Sandbox has already been removed.")
 
+    async def _run_as_root(self, command: str, timeout_sec: int) -> ExecResult:
+        """Run a transfer helper command as root in ``/``.
+
+        Not ``exec``: that adds the image environment, Harbor's env overlays
+        and the task workdir, which may not exist yet.
+        """
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+        try:
+            result = await self._sandbox.commands.run(
+                cmd=command, user="root", cwd="/", timeout=timeout_sec
+            )
+        except CommandExitException as exc:
+            result = exc
+        return ExecResult(
+            stdout=result.stdout, stderr=result.stderr, return_code=result.exit_code
+        )
+
+    # Transfers run as root, as ``docker cp`` does: Harbor targets root-owned
+    # paths such as /tests, /solution and /logs, whatever the image's user.
+
     @retry(
         stop=stop_after_attempt(2),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -1181,7 +1541,7 @@ class E2BEnvironment(BaseEnvironment):
     @override
     async def upload_file(self, source_path: Path | str, target_path: str):
         """
-        Adds a local file to the environment.
+        Adds a local file to the environment, keeping its permission bits.
 
         Args:
             source_path: The path to the source local file.
@@ -1190,7 +1550,18 @@ class E2BEnvironment(BaseEnvironment):
         if not self._sandbox:
             raise RuntimeError("Sandbox not found. Please start the environment first.")
 
-        await self._sandbox.files.write(target_path, Path(source_path).read_bytes())
+        source = Path(source_path)
+        await self._sandbox.files.write(target_path, source.read_bytes(), user="root")
+        # The files API creates 0644 files; restore the source's mode so an
+        # uploaded script stays executable.
+        mode = stat.S_IMODE(source.stat().st_mode)
+        result = await self._run_as_root(
+            f"chmod {mode:o} {shlex.quote(target_path)}", _CHMOD_TIMEOUT_SEC
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                f"Failed to set permissions on {target_path}: {result.stderr}"
+            )
 
     @retry(
         stop=stop_after_attempt(2),
@@ -1202,6 +1573,12 @@ class E2BEnvironment(BaseEnvironment):
         """
         Adds a local directory to the environment.
 
+        Packs the directory into one gzipped tar archive, uploads it, and
+        extracts it as root with ``--no-same-owner``, so modes, symlinks and
+        empty directories survive as with ``docker cp``. The archive has no
+        ``.`` entry, so an existing ``target_dir`` keeps its own mode and
+        owner. Requires tar and gzip in the sandbox image.
+
         Args:
             source_dir: The path to the source local directory.
             target_dir: The path to which to copy the directory.
@@ -1209,23 +1586,32 @@ class E2BEnvironment(BaseEnvironment):
         if not self._sandbox:
             raise RuntimeError("Sandbox not found. Please start the environment first.")
 
-        files: list[WriteEntry] = []
-        for file_path in Path(source_dir).rglob("*"):
-            if file_path.is_file():
-                files.append(
-                    WriteEntry(
-                        path=str(
-                            PurePosixPath(target_dir)
-                            / file_path.relative_to(Path(source_dir)).as_posix()
-                        ),
-                        data=file_path.read_bytes(),
-                    )
-                )
+        source = Path(source_dir)
+        if not source.is_dir():
+            raise FileNotFoundError(f"Source directory {source_dir} does not exist")
 
-        if files:
-            for i in range(0, len(files), self._UPLOAD_BATCH_SIZE):
-                batch = files[i : i + self._UPLOAD_BATCH_SIZE]
-                await self._sandbox.files.write_files(batch)
+        archive = await asyncio.to_thread(
+            pack_dir_to_bytes, source, compress=True, include_root=False
+        )
+        # A unique name per attempt, so a retry never extracts a stale archive.
+        remote_archive = f"/tmp/harbor_upload_{uuid4().hex}.tar.gz"
+        try:
+            await self._sandbox.files.write(
+                remote_archive, archive.getvalue(), user="root"
+            )
+            result = await self._run_as_root(
+                remote_unpack_command(remote_archive, target_dir, no_same_owner=True),
+                _TAR_TIMEOUT_SEC,
+            )
+            if result.return_code != 0:
+                raise RuntimeError(
+                    f"Failed to extract uploaded archive into {target_dir} "
+                    f"(sandbox images must provide tar and gzip): {result.stderr}"
+                )
+        finally:
+            await self._run_as_root(
+                f"rm -f {shlex.quote(remote_archive)}", _CLEANUP_TIMEOUT_SEC
+            )
 
     @retry(
         stop=stop_after_attempt(2),
@@ -1245,7 +1631,7 @@ class E2BEnvironment(BaseEnvironment):
             raise RuntimeError("Sandbox not found. Please start the environment first.")
 
         Path(target_path).write_bytes(
-            await self._sandbox.files.read(source_path, format="bytes"),
+            await self._sandbox.files.read(source_path, format="bytes", user="root"),
         )
 
     @retry(
@@ -1259,6 +1645,10 @@ class E2BEnvironment(BaseEnvironment):
         Downloads a directory from the environment to the local machine. This overwrites
         existing files in the target directory.
 
+        Packs the directory into one gzipped tar archive as root, streams it to
+        a local temporary file, and extracts it there. Requires tar and gzip in
+        the sandbox image.
+
         Args:
             source_dir: The path to the source directory in the environment.
             target_dir: The local path to which to copy the directory.
@@ -1266,45 +1656,59 @@ class E2BEnvironment(BaseEnvironment):
         if not self._sandbox:
             raise RuntimeError("Sandbox not found. Please start the environment first.")
 
-        results = await self._sandbox.files.list(source_dir)
-
-        for result in results:
-            if result.type == FileType.DIR:
-                sub_target_dir = Path(target_dir) / Path(result.path).relative_to(
-                    Path(source_dir)
+        target = Path(target_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        remote_archive = f"/tmp/harbor_download_{uuid4().hex}.tar.gz"
+        try:
+            result = await self._run_as_root(
+                remote_pack_command(source_dir, remote_archive), _TAR_TIMEOUT_SEC
+            )
+            if not tar_pack_succeeded(
+                result.return_code,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                logger=self.logger,
+            ):
+                raise RuntimeError(
+                    f"Failed to archive {source_dir} in the sandbox "
+                    f"(sandbox images must provide tar and gzip): {result.stderr}"
                 )
-                sub_target_dir.mkdir(parents=True, exist_ok=True)
-
-                await self.download_dir(
-                    source_dir=result.path,
-                    target_dir=sub_target_dir,
-                )
-
-            if result.type == FileType.FILE:
-                target_path = Path(target_dir) / Path(result.path).relative_to(
-                    Path(source_dir)
-                )
-
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-
-                await self.download_file(
-                    source_path=result.path,
-                    target_path=str(target_path),
-                )
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                archive_path = Path(tmp_dir) / "download.tar.gz"
+                async with await self._sandbox.files.read(
+                    remote_archive, format="stream", user="root"
+                ) as stream:
+                    with archive_path.open("wb") as archive:
+                        async for chunk in stream:
+                            archive.write(chunk)
+                await asyncio.to_thread(extract_dir_from_file, archive_path, target)
+        finally:
+            await self._run_as_root(
+                f"rm -f {shlex.quote(remote_archive)}", _CLEANUP_TIMEOUT_SEC
+            )
 
     @override
     async def is_dir(self, path: str, user: str | int | None = None) -> bool:
-        if not self._sandbox:
-            raise RuntimeError("Sandbox not found. Please start the environment first.")
-        info = await self._sandbox.files.get_info(path)
-        return info.type == FileType.DIR
+        return await self._path_type(path, user) == FileType.DIR
 
     @override
     async def is_file(self, path: str, user: str | int | None = None) -> bool:
+        return await self._path_type(path, user) == FileType.FILE
+
+    async def _path_type(self, path: str, user: str | int | None) -> FileType | None:
+        """The type of ``path``, or None if it does not exist.
+
+        Looked up as ``user`` if given, else as root like the transfers.
+        """
         if not self._sandbox:
             raise RuntimeError("Sandbox not found. Please start the environment first.")
-        info = await self._sandbox.files.get_info(path)
-        return info.type == FileType.FILE
+        try:
+            info = await self._sandbox.files.get_info(
+                path, user=str(user) if user is not None else "root"
+            )
+        except FileNotFoundException:
+            return None
+        return info.type
 
     @retry(
         stop=stop_after_attempt(3),
@@ -1356,17 +1760,24 @@ class E2BEnvironment(BaseEnvironment):
             env: The environment  variables to set.
             timeout_sec: The timeout in seconds.
             user: Username or UID to run the command as. None falls back to
-                ``self.default_user``; if that is also None the sandbox default is used.
+                ``self.default_user``; if that is also None, to
+                ``default_exec_user`` (the image's user, as ``docker exec``).
         """
         user = self._resolve_user(user)
-        env = self._merge_env(env)
+        # Precedence, lowest first: image environment (captured at build),
+        # task/trial startup env, then Harbor's persistent/per-exec/scoped
+        # overlays. envd applies request envs over its defaults, so the image
+        # values must be passed explicitly to sit underneath the others.
+        merged_env = {**self._exec_base_env, **(self._merge_env(env) or {})}
 
         handle = await self._dispatch_command(
             command,
             cwd=effective_exec_cwd(cwd, self.task_env_config.workdir, self._workdir),
-            env=env,
+            env=merged_env or None,
             timeout_sec=timeout_sec,
-            user=str(user) if user is not None else "root",
+            # Docker exec without -u runs as the image's user; pass it
+            # explicitly rather than relying on the sandbox default.
+            user=str(user) if user is not None else self.default_exec_user,
         )
 
         # Deliberately not retried: the command is already running on the
