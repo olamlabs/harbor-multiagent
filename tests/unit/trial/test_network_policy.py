@@ -1512,7 +1512,7 @@ def _separate_dockerfile_verifier_task(tmp_path: Path) -> Path:
         "#!/bin/bash\necho 1 > /logs/verifier/reward.txt\n"
     )
     (tmp_path / "trials").mkdir()
-    return task_dir
+    return task_dir.resolve()
 
 
 class TestSeparateVerifierStartPrerequisites:
