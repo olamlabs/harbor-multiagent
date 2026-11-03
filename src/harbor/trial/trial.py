@@ -212,6 +212,7 @@ class Trial(ABC):
             self._init_agent_environment()
             self._init_artifact_handler()
             self._validate_network_policy_modes()
+            self._validate_start_prerequisites()
         except BaseException:
             self._close_logger_handler()
             raise
@@ -385,6 +386,28 @@ class Trial(ABC):
                     "environment cannot change network policy after start."
                 )
             baseline = plan.agent_env_baseline
+
+    def _validate_start_prerequisites(self) -> None:
+        """Fail before the agent runs when an environment this trial starts cannot be."""
+        if self.config.install_only:
+            return
+        if not self.config.is_regrade:
+            EnvironmentFactory.validate_start_prerequisites(
+                self.config.environment, self.task.paths.environment_dir
+            )
+        if self.config.verifier.disable:
+            return
+        verifier_runtime_config = self.config.environment.model_copy(
+            update={"extra_docker_compose": []}
+        )
+        for step_cfg in self.task.config.steps or [None]:
+            definition = resolve_verifier_environment_definition(
+                self.task.config, self.task.paths, step_cfg
+            )
+            if definition is not None:
+                EnvironmentFactory.validate_start_prerequisites(
+                    verifier_runtime_config, definition.directory
+                )
 
     def _validate_network_plan(
         self,

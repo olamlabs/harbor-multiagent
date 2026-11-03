@@ -7,6 +7,7 @@ import io
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -434,7 +435,14 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         # right value. A task is multi-container when it ships a
         # docker-compose.yaml; --extra-docker-compose can also enable it (OR-ed
         # in below once the base class has normalized those paths).
-        self._compose_mode = (environment_dir / "docker-compose.yaml").exists()
+        dockerfile_build = kwargs.get("dockerfile_build", "cloud_build")
+        if dockerfile_build not in ("cloud_build", "dind"):
+            raise ValueError(
+                f"dockerfile_build must be 'cloud_build' or 'dind', got {dockerfile_build!r}"
+            )
+        self._compose_mode = (
+            environment_dir / "docker-compose.yaml"
+        ).exists() or dockerfile_build == "dind"
         self._kwargs = kwargs
 
         super().__init__(
@@ -508,6 +516,35 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         self._dind: _GKEDinDCompose | None = (
             _GKEDinDCompose(self) if self._compose_mode else None
         )
+
+    @classmethod
+    @override
+    def validate_start_prerequisites(cls, environment_dir: Path, **kwargs) -> None:
+        if (
+            (environment_dir / "docker-compose.yaml").exists()
+            or kwargs.get("dockerfile_build") == "dind"
+            or kwargs.get("extra_docker_compose")
+        ):
+            return
+        if shutil.which("gcloud") is None:
+            raise RuntimeError(
+                f"{environment_dir} has a Dockerfile and no docker-compose.yaml, so "
+                "GKE builds it with Cloud Build ('gcloud builds submit'), but gcloud is "
+                "not on PATH. Install the gcloud CLI with credentials that can run Cloud "
+                "Build, or pass the environment kwarg dockerfile_build=dind to build it in "
+                "the trial's Docker-in-Docker pod."
+            )
+        command = ["gcloud", "builds", "list", "--limit", "1", "--format", "value(id)"]
+        if region := kwargs.get("region"):
+            command += ["--region", region]
+        if project_id := kwargs.get("project_id"):
+            command += ["--project", project_id]
+        check = subprocess.run(command, capture_output=True, text=True)
+        if check.returncode != 0:
+            raise RuntimeError(
+                f"{environment_dir} is built with Cloud Build, but gcloud cannot use "
+                f"Cloud Build: {check.stderr.strip()}"
+            )
 
     def _get_default_project(self) -> str:
         """Get default GCP project from environment or gcloud config."""
@@ -612,7 +649,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     def _validate_definition(self):
         path = (
             self._environment_docker_compose_path
-            if self._compose_mode
+            if self._environment_docker_compose_path.exists()
             else self._environment_definition_path
         )
         if not path.exists():
@@ -1958,8 +1995,9 @@ class _GKEDinDCompose(DinDComposeOps):
         files = [
             f"{self._COMPOSE_DIR}/{RESOURCES_COMPOSE_NAME}",
             f"{self._COMPOSE_DIR}/{build_or_prebuilt}",
-            f"{self._ENVIRONMENT_DIR}/docker-compose.yaml",
         ]
+        if env._environment_docker_compose_path.exists():
+            files.append(f"{self._ENVIRONMENT_DIR}/docker-compose.yaml")
         files.extend(self._extra_compose_target_paths())
         files.append(f"{self._COMPOSE_DIR}/{ENV_COMPOSE_NAME}")
         if env._network_disabled:

@@ -280,6 +280,22 @@ class EnvironmentFactory:
         env_class.preflight()
 
     @classmethod
+    def validate_start_prerequisites(
+        cls, config: TrialEnvironmentConfig, environment_dir: Path
+    ) -> None:
+        """Run the environment type's start prerequisite check for environment_dir."""
+        if config.import_path is not None:
+            env_class = import_symbol(config.import_path)
+        elif config.type is not None and config.type in _ENVIRONMENT_REGISTRY:
+            env_class = _load_environment_class(config.type)
+        else:
+            return
+        env_class.validate_start_prerequisites(
+            environment_dir,
+            **{"extra_docker_compose": config.extra_docker_compose, **config.kwargs},
+        )
+
+    @classmethod
     def resource_capabilities(
         cls,
         type: EnvironmentType | None,

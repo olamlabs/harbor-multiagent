@@ -1076,6 +1076,17 @@ class BaseEnvironment(ABC):
             )
 
     @classmethod
+    def validate_start_prerequisites(cls, environment_dir: Path, **kwargs) -> None:
+        """Check, before a trial runs any agent, that this type can start environment_dir.
+
+        kwargs are the environment kwargs the trial will construct it with. Trials call
+        this for the agent environment and for every separate verifier environment, so
+        a verifier that could never be built fails before the agent spends anything.
+        Subclasses override it for host-side tools or credentials that their build or
+        start path needs.
+        """
+
+    @classmethod
     def preflight(cls) -> None:
         """Check that required credentials/config are available before queueing trials.
 

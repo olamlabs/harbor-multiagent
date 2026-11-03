@@ -1522,6 +1522,109 @@ class TestGKEComposeFileFlags:
         assert "/harbor/compose/docker-compose-build.yaml" not in paths
 
 
+def _make_gke_dockerfile_env(temp_dir, **kwargs):
+    env_dir = temp_dir / "environment"
+    env_dir.mkdir(exist_ok=True)
+    (env_dir / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+    trial_paths = TrialPaths(trial_dir=temp_dir / "trial")
+    trial_paths.mkdir()
+    return GKEEnvironment(
+        environment_dir=env_dir,
+        environment_name="dockerfile-task",
+        session_id="dockerfile-task__abc123",
+        trial_paths=trial_paths,
+        task_env_config=EnvironmentConfig(cpus=2, memory_mb=4096, storage_mb=10240),
+        cluster_name="test-cluster",
+        region="us-central1",
+        namespace="default",
+        registry_location="us-central1",
+        registry_name="test-images",
+        project_id="test-project",
+        **kwargs,
+    )
+
+
+class TestGKEDockerfileBuild:
+    """dockerfile_build=dind runs a Dockerfile-only environment in the DinD pod."""
+
+    def test_dind_runs_dockerfile_environment_in_compose_mode(self, temp_dir):
+        env = _make_gke_dockerfile_env(temp_dir, dockerfile_build="dind")
+        assert env._compose_mode is True
+        assert env._dind is not None
+        assert env._dind._compose_file_flags()[1::2] == [
+            "/harbor/compose/docker-compose-resources.json",
+            "/harbor/compose/docker-compose-build.yaml",
+            "/harbor/compose/docker-compose-environment.json",
+        ]
+
+    def test_cloud_build_is_the_default(self, temp_dir):
+        env = _make_gke_dockerfile_env(temp_dir)
+        assert env._compose_mode is False
+        assert env._dind is None
+
+    def test_unknown_build_route_is_refused(self, temp_dir):
+        with pytest.raises(ValueError, match="dockerfile_build"):
+            _make_gke_dockerfile_env(temp_dir, dockerfile_build="kaniko")
+
+    def test_dind_needs_no_gcloud(self, temp_dir, monkeypatch):
+        monkeypatch.setattr(gke_module.shutil, "which", lambda name: None)
+        env = _make_gke_dockerfile_env(temp_dir, dockerfile_build="dind")
+        GKEEnvironment.validate_start_prerequisites(
+            env.environment_dir, dockerfile_build="dind"
+        )
+
+    def test_cloud_build_without_gcloud_fails_before_start(self, temp_dir, monkeypatch):
+        monkeypatch.setattr(gke_module.shutil, "which", lambda name: None)
+        env = _make_gke_dockerfile_env(temp_dir)
+        with pytest.raises(RuntimeError, match="gcloud is not on PATH"):
+            GKEEnvironment.validate_start_prerequisites(env.environment_dir)
+
+    def test_cloud_build_without_access_fails_before_start(self, temp_dir, monkeypatch):
+        monkeypatch.setattr(gke_module.shutil, "which", lambda name: "/usr/bin/gcloud")
+        commands = []
+
+        def run(command, **kwargs):
+            commands.append(command)
+            return MagicMock(
+                returncode=1,
+                stderr="PERMISSION_DENIED: The caller does not have permission",
+            )
+
+        monkeypatch.setattr(gke_module.subprocess, "run", run)
+        env = _make_gke_dockerfile_env(temp_dir)
+        with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+            GKEEnvironment.validate_start_prerequisites(
+                env.environment_dir, project_id="test-project", region="us-central1"
+            )
+        assert commands == [
+            [
+                "gcloud",
+                "builds",
+                "list",
+                "--limit",
+                "1",
+                "--format",
+                "value(id)",
+                "--region",
+                "us-central1",
+                "--project",
+                "test-project",
+            ]
+        ]
+
+    def test_compose_environment_needs_no_gcloud(self, temp_dir, monkeypatch):
+        monkeypatch.setattr(gke_module.shutil, "which", lambda name: None)
+        env = _make_gke_compose_env(temp_dir)
+        GKEEnvironment.validate_start_prerequisites(env.environment_dir)
+
+    def test_extra_compose_needs_no_gcloud(self, temp_dir, monkeypatch):
+        monkeypatch.setattr(gke_module.shutil, "which", lambda name: None)
+        env = _make_gke_dockerfile_env(temp_dir)
+        GKEEnvironment.validate_start_prerequisites(
+            env.environment_dir, extra_docker_compose=[temp_dir / "extra.yaml"]
+        )
+
+
 def _exec_result(return_code: int = 0):
     from harbor.environments.base import ExecResult
 
