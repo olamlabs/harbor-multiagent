@@ -1075,6 +1075,15 @@ class BaseEnvironment(ABC):
                 "Use an environment type that does (currently: docker, daytona)."
             )
 
+    def validate_start_prerequisites(self) -> None:
+        """Check, before the trial runs any agent, that this environment can be started.
+
+        Trials call this for the agent environment and for every separate verifier
+        environment when they are created, so a verifier that could never be built
+        fails before the agent spends anything. Subclasses override it for host-side
+        tools or credentials that their build or start path needs.
+        """
+
     @classmethod
     def preflight(cls) -> None:
         """Check that required credentials/config are available before queueing trials.
