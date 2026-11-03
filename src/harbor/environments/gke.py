@@ -517,40 +517,33 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             _GKEDinDCompose(self) if self._compose_mode else None
         )
 
+    @classmethod
     @override
-    def validate_start_prerequisites(self) -> None:
-        if self._compose_mode:
+    def validate_start_prerequisites(cls, environment_dir: Path, **kwargs) -> None:
+        if (
+            (environment_dir / "docker-compose.yaml").exists()
+            or kwargs.get("dockerfile_build") == "dind"
+            or kwargs.get("extra_docker_compose")
+        ):
             return
         if shutil.which("gcloud") is None:
             raise RuntimeError(
-                f"{self.environment_dir} has a Dockerfile and no docker-compose.yaml, so "
+                f"{environment_dir} has a Dockerfile and no docker-compose.yaml, so "
                 "GKE builds it with Cloud Build ('gcloud builds submit'), but gcloud is "
                 "not on PATH. Install the gcloud CLI with credentials that can run Cloud "
                 "Build, or pass the environment kwarg dockerfile_build=dind to build it in "
                 "the trial's Docker-in-Docker pod."
             )
-        check = subprocess.run(
-            [
-                "gcloud",
-                "builds",
-                "list",
-                "--project",
-                self.project_id,
-                "--region",
-                self.region,
-                "--limit",
-                "1",
-                "--format",
-                "value(id)",
-            ],
-            capture_output=True,
-            text=True,
-        )
+        command = ["gcloud", "builds", "list", "--limit", "1", "--format", "value(id)"]
+        if region := kwargs.get("region"):
+            command += ["--region", region]
+        if project_id := kwargs.get("project_id"):
+            command += ["--project", project_id]
+        check = subprocess.run(command, capture_output=True, text=True)
         if check.returncode != 0:
             raise RuntimeError(
-                f"{self.environment_dir} is built with Cloud Build, but gcloud cannot use "
-                f"Cloud Build in project {self.project_id} ({self.region}): "
-                f"{check.stderr.strip()}"
+                f"{environment_dir} is built with Cloud Build, but gcloud cannot use "
+                f"Cloud Build: {check.stderr.strip()}"
             )
 
     def _get_default_project(self) -> str:

@@ -163,7 +163,6 @@ def _stock_mock_env() -> AsyncMock:
     env.start.return_value = None
     env.stop.return_value = None
     env.validate_network_policy_support = MagicMock()
-    env.validate_start_prerequisites = MagicMock()
 
     @contextlib.contextmanager
     def with_default_user(user: str | int | None):
@@ -1498,70 +1497,71 @@ class TestSharedVerifierPhasePolicy:
             assert env.network_policy == environment_baseline
 
 
+def _separate_dockerfile_verifier_task(tmp_path: Path) -> Path:
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    (task_dir / "task.toml").write_text(
+        '[verifier]\nenvironment_mode = "separate"\n[verifier.environment]\n'
+    )
+    (task_dir / "instruction.md").write_text("Do nothing.\n")
+    (task_dir / "environment").mkdir()
+    (task_dir / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+    (task_dir / "tests").mkdir()
+    (task_dir / "tests" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
+    (task_dir / "tests" / "test.sh").write_text(
+        "#!/bin/bash\necho 1 > /logs/verifier/reward.txt\n"
+    )
+    (tmp_path / "trials").mkdir()
+    return task_dir
+
+
 class TestSeparateVerifierStartPrerequisites:
     async def test_unbuildable_verifier_fails_before_the_agent_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            task_dir = tmp_path / "task"
-            task_dir.mkdir()
-            (task_dir / "task.toml").write_text(
-                '[verifier]\nenvironment_mode = "separate"\n[verifier.environment]\n'
-            )
-            (task_dir / "instruction.md").write_text("Do nothing.\n")
-            (task_dir / "environment").mkdir()
-            (task_dir / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
-            (task_dir / "tests").mkdir()
-            (task_dir / "tests" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
-            (task_dir / "tests" / "test.sh").write_text(
-                "#!/bin/bash\necho 1 > /logs/verifier/reward.txt\n"
-            )
-            trials_dir = tmp_path / "trials"
-            trials_dir.mkdir()
-
+            task_dir = _separate_dockerfile_verifier_task(tmp_path)
             agent_env = _stock_mock_env()
             verifier_env = _stock_mock_env()
-            verifier_env.validate_start_prerequisites = MagicMock(
-                side_effect=RuntimeError("gcloud is not on PATH")
-            )
             fake_create, calls = _make_factory_recorder(agent_env, [verifier_env])
 
-            with pytest.raises(RuntimeError, match="gcloud is not on PATH"):
-                await _run_trial(task_dir, trials_dir, fake_create)
+            def check(config, environment_dir):
+                if environment_dir == task_dir / "tests":
+                    raise RuntimeError("gcloud is not on PATH")
 
-            assert len(calls) == 2
-            agent_env.validate_start_prerequisites.assert_called_once()
+            with (
+                patch.object(
+                    EnvironmentFactory,
+                    "validate_start_prerequisites",
+                    side_effect=check,
+                ),
+                pytest.raises(RuntimeError, match="gcloud is not on PATH"),
+            ):
+                await _run_trial(task_dir, tmp_path / "trials", fake_create)
+
+            assert len(calls) == 1
             agent_env.start.assert_not_awaited()
             verifier_env.start.assert_not_awaited()
 
-    async def test_prepared_verifier_env_is_the_one_started(self):
+    async def test_checks_agent_and_verifier_directories(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            task_dir = tmp_path / "task"
-            task_dir.mkdir()
-            (task_dir / "task.toml").write_text(
-                '[verifier]\nenvironment_mode = "separate"\n[verifier.environment]\n'
-            )
-            (task_dir / "instruction.md").write_text("Do nothing.\n")
-            (task_dir / "environment").mkdir()
-            (task_dir / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
-            (task_dir / "tests").mkdir()
-            (task_dir / "tests" / "Dockerfile").write_text("FROM ubuntu:24.04\n")
-            (task_dir / "tests" / "test.sh").write_text(
-                "#!/bin/bash\necho 1 > /logs/verifier/reward.txt\n"
-            )
-            trials_dir = tmp_path / "trials"
-            trials_dir.mkdir()
-
+            task_dir = _separate_dockerfile_verifier_task(tmp_path)
             agent_env = _stock_mock_env()
             verifier_env = _stock_mock_env()
             fake_create, calls = _make_factory_recorder(agent_env, [verifier_env])
 
-            trial = await _run_trial(task_dir, trials_dir, fake_create)
+            with patch.object(
+                EnvironmentFactory, "validate_start_prerequisites"
+            ) as check:
+                await _run_trial(task_dir, tmp_path / "trials", fake_create)
 
+            assert [c.args[1] for c in check.call_args_list] == [
+                task_dir / "environment",
+                task_dir / "tests",
+            ]
+            assert check.call_args_list[1].args[0].extra_docker_compose == []
             assert len(calls) == 2
-            verifier_env.validate_start_prerequisites.assert_called_once()
             verifier_env.start.assert_awaited_once()
-            assert trial._prepared_verifier_envs == {}
 
 
 class TestSeparateVerifierPhasePolicy:

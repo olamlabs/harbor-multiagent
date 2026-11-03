@@ -1568,33 +1568,61 @@ class TestGKEDockerfileBuild:
 
     def test_dind_needs_no_gcloud(self, temp_dir, monkeypatch):
         monkeypatch.setattr(gke_module.shutil, "which", lambda name: None)
-        _make_gke_dockerfile_env(
-            temp_dir, dockerfile_build="dind"
-        ).validate_start_prerequisites()
+        env = _make_gke_dockerfile_env(temp_dir, dockerfile_build="dind")
+        GKEEnvironment.validate_start_prerequisites(
+            env.environment_dir, dockerfile_build="dind"
+        )
 
     def test_cloud_build_without_gcloud_fails_before_start(self, temp_dir, monkeypatch):
         monkeypatch.setattr(gke_module.shutil, "which", lambda name: None)
         env = _make_gke_dockerfile_env(temp_dir)
         with pytest.raises(RuntimeError, match="gcloud is not on PATH"):
-            env.validate_start_prerequisites()
+            GKEEnvironment.validate_start_prerequisites(env.environment_dir)
 
     def test_cloud_build_without_access_fails_before_start(self, temp_dir, monkeypatch):
         monkeypatch.setattr(gke_module.shutil, "which", lambda name: "/usr/bin/gcloud")
-        monkeypatch.setattr(
-            gke_module.subprocess,
-            "run",
-            lambda *args, **kwargs: MagicMock(
+        commands = []
+
+        def run(command, **kwargs):
+            commands.append(command)
+            return MagicMock(
                 returncode=1,
                 stderr="PERMISSION_DENIED: The caller does not have permission",
-            ),
-        )
+            )
+
+        monkeypatch.setattr(gke_module.subprocess, "run", run)
         env = _make_gke_dockerfile_env(temp_dir)
         with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
-            env.validate_start_prerequisites()
+            GKEEnvironment.validate_start_prerequisites(
+                env.environment_dir, project_id="test-project", region="us-central1"
+            )
+        assert commands == [
+            [
+                "gcloud",
+                "builds",
+                "list",
+                "--limit",
+                "1",
+                "--format",
+                "value(id)",
+                "--region",
+                "us-central1",
+                "--project",
+                "test-project",
+            ]
+        ]
 
     def test_compose_environment_needs_no_gcloud(self, temp_dir, monkeypatch):
         monkeypatch.setattr(gke_module.shutil, "which", lambda name: None)
-        _make_gke_compose_env(temp_dir).validate_start_prerequisites()
+        env = _make_gke_compose_env(temp_dir)
+        GKEEnvironment.validate_start_prerequisites(env.environment_dir)
+
+    def test_extra_compose_needs_no_gcloud(self, temp_dir, monkeypatch):
+        monkeypatch.setattr(gke_module.shutil, "which", lambda name: None)
+        env = _make_gke_dockerfile_env(temp_dir)
+        GKEEnvironment.validate_start_prerequisites(
+            env.environment_dir, extra_docker_compose=[temp_dir / "extra.yaml"]
+        )
 
 
 def _exec_result(return_code: int = 0):

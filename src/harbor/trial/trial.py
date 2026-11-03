@@ -203,7 +203,6 @@ class Trial(ABC):
         self._log_handler: logging.Handler | None = None
         self._log_callbacks: list[LogCallback] = []
         self._warned_inference_agents: set[str] = set()
-        self._prepared_verifier_envs: dict[str, BaseEnvironment] = {}
 
         try:
             self._init_logger()
@@ -392,23 +391,23 @@ class Trial(ABC):
         """Fail before the agent runs when an environment this trial starts cannot be."""
         if self.config.install_only:
             return
-        self.agent_environment.validate_start_prerequisites()
+        if not self.config.is_regrade:
+            EnvironmentFactory.validate_start_prerequisites(
+                self.config.environment, self.task.paths.environment_dir
+            )
         if self.config.verifier.disable:
             return
+        verifier_runtime_config = self.config.environment.model_copy(
+            update={"extra_docker_compose": []}
+        )
         for step_cfg in self.task.config.steps or [None]:
             definition = resolve_verifier_environment_definition(
                 self.task.config, self.task.paths, step_cfg
             )
-            if definition is None:
-                continue
-            key = step_cfg.name if step_cfg is not None else "trial"
-            env = self._create_separate_verifier_env(
-                definition,
-                key=key,
-                plan=self._network_plan(step_cfg, env_config=definition.config),
-            )
-            env.validate_start_prerequisites()
-            self._prepared_verifier_envs[key] = env
+            if definition is not None:
+                EnvironmentFactory.validate_start_prerequisites(
+                    verifier_runtime_config, definition.directory
+                )
 
     def _validate_network_plan(
         self,
@@ -1127,38 +1126,6 @@ class Trial(ABC):
         key: str,
         plan: TrialNetworkPlan,
     ) -> AsyncGenerator[BaseEnvironment, None]:
-        env = self._prepared_verifier_envs.pop(
-            key, None
-        ) or self._create_separate_verifier_env(definition, key=key, plan=plan)
-        self._validate_separate_verifier_env_policies(env, plan=plan)
-        try:
-            timeout_scope = asyncio.timeout(self._environment_build_timeout_sec)
-            try:
-                async with timeout_scope:
-                    await env.start(force_build=False)
-            except asyncio.TimeoutError as exc:
-                if timeout_scope.expired():
-                    raise EnvironmentStartTimeoutError(
-                        "Verifier environment start timed out after "
-                        f"{self._environment_build_timeout_sec} seconds"
-                    ) from exc
-                raise EnvironmentStartTimeoutError(
-                    f"Verifier environment failed to start: {exc}"
-                ) from exc
-            yield env
-        finally:
-            try:
-                await asyncio.shield(env.stop(delete=self.config.environment.delete))
-            except Exception as exc:
-                self.logger.debug(f"Failed to stop verifier env '{key}': {exc}")
-
-    def _create_separate_verifier_env(
-        self,
-        definition: VerifierEnvironmentDefinition,
-        *,
-        key: str,
-        plan: TrialNetworkPlan,
-    ) -> BaseEnvironment:
         env_config = definition.config
         verifier_runtime_config = self.config.environment.model_copy(
             update={"extra_docker_compose": []}
@@ -1182,7 +1149,27 @@ class Trial(ABC):
             phase_network_policies=[plan.verifier_phase],
         )
         env.context_id = self._id
-        return env
+        self._validate_separate_verifier_env_policies(env, plan=plan)
+        try:
+            timeout_scope = asyncio.timeout(self._environment_build_timeout_sec)
+            try:
+                async with timeout_scope:
+                    await env.start(force_build=False)
+            except asyncio.TimeoutError as exc:
+                if timeout_scope.expired():
+                    raise EnvironmentStartTimeoutError(
+                        "Verifier environment start timed out after "
+                        f"{self._environment_build_timeout_sec} seconds"
+                    ) from exc
+                raise EnvironmentStartTimeoutError(
+                    f"Verifier environment failed to start: {exc}"
+                ) from exc
+            yield env
+        finally:
+            try:
+                await asyncio.shield(env.stop(delete=self.config.environment.delete))
+            except Exception as exc:
+                self.logger.debug(f"Failed to stop verifier env '{key}': {exc}")
 
     def _verifier_env_mounts(
         self,
