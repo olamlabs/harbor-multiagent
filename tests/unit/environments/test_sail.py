@@ -1,6 +1,7 @@
 """Unit tests for SailEnvironment."""
 
 import asyncio
+import base64
 import json
 import logging
 import sys
@@ -185,8 +186,6 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     app_cls = MagicMock()
     app_cls.find.aio = AsyncMock(return_value="app-handle")
     sailbox_cls = MagicMock()
-    # Size selection reads the SDK's size table, which is local data.
-    sailbox_cls.size_for = sail_mod.Sailbox.size_for
     sailbox_cls.create.aio = AsyncMock(return_value=sailbox)
 
     monkeypatch.setattr(sail_mod, "Image", image_cls)
@@ -240,13 +239,14 @@ class TestSizeSelection:
     @pytest.mark.parametrize(
         ("cpus", "memory_mb", "storage_mb", "expected"),
         [
-            (None, None, None, ("s", None, None)),
-            (1, 1500, 33 * 1024, ("s", None, 33)),
-            (4, 40 * 1024, None, ("m", 40, None)),
-            (8, 65 * 1024, 300 * 1024, ("l", 65, 300)),
+            (None, None, None, (None, None, None)),
+            (1, 1500, 33 * 1024, (1, 2, 33)),
+            (4, 40 * 1024, None, (4, 40, None)),
+            (32, 128 * 1024, 300 * 1024, (32, 128, 300)),
+            (64, 256 * 1024, None, (64, 256, None)),
         ],
     )
-    async def test_creates_the_smallest_size_that_covers_the_request(
+    async def test_creates_a_sailbox_with_the_requested_vcpus_memory_and_disk(
         self, temp_dir, sdk, cpus, memory_mb, storage_mb, expected
     ):
         env = _make_env(temp_dir, cpus=cpus, memory_mb=memory_mb, storage_mb=storage_mb)
@@ -254,19 +254,81 @@ class TestSizeSelection:
         await env.start(force_build=False)
 
         kwargs = sdk.Sailbox.create.aio.await_args.kwargs
+        assert "size" not in kwargs
         assert (
-            kwargs["size"],
+            kwargs["vcpu_count"],
             kwargs["memory_limit_gib"],
             kwargs["disk_limit_gib"],
         ) == expected
 
-    async def test_oversized_task_fails_start(self, temp_dir, sdk):
-        env = _make_env(temp_dir, cpus=16)
 
-        with pytest.raises(ValueError, match="16 vCPU"):
-            await env.start(force_build=False)
+class TestRegistryLogins:
+    @staticmethod
+    def _docker_config(temp_dir: Path) -> Path:
+        path = temp_dir / "config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "auths": {
+                        "ghcr.io": {
+                            "auth": base64.b64encode(b"octocat:t0ken").decode()
+                        },
+                        "https://index.docker.io/v1/": {
+                            "username": "hubuser",
+                            "password": "hubpass",
+                        },
+                    }
+                }
+            )
+        )
+        return path
 
-        sdk.Sailbox.create.aio.assert_not_awaited()
+    def _env(self, temp_dir: Path, **kwargs) -> SailEnvironment:
+        return _make_env(
+            temp_dir,
+            environment_kwargs={
+                "docker_config_path": str(self._docker_config(temp_dir))
+            },
+            **kwargs,
+        )
+
+    def test_reads_each_login_in_a_docker_config(self, temp_dir):
+        logins = self._env(temp_dir)._registry_logins
+
+        assert [(login.prefix, login.username) for login in logins] == [
+            ("ghcr.io", "octocat"),
+            ("docker.io", "hubuser"),
+        ]
+        assert all(login.password is not None for login in logins)
+
+    @pytest.mark.parametrize("compose", [False, True])
+    async def test_image_builds_get_the_logins(self, temp_dir, sdk, compose):
+        env = self._env(temp_dir, compose=compose)
+
+        await env.start(force_build=False)
+
+        build = sdk.Image.from_compose.aio if compose else sdk.Image.from_dockerfile.aio
+        assert build.await_args.kwargs["registry_logins"] == env._registry_logins
+
+    async def test_a_prebuilt_image_is_pulled_with_its_registry_login(
+        self, temp_dir, sdk
+    ):
+        env = self._env(temp_dir, docker_image="ghcr.io/acme/app:1")
+
+        await env.start(force_build=False)
+
+        sdk.Image.from_registry.assert_called_once_with(
+            "ghcr.io/acme/app:1",
+            username="octocat",
+            password=env._registry_logins[0].password,
+        )
+
+    async def test_no_config_passes_no_logins(self, temp_dir, sdk):
+        env = _make_env(temp_dir, compose=True)
+
+        await env.start(force_build=False)
+
+        assert sdk.Image.from_compose.aio.await_args.kwargs["registry_logins"] is None
 
 
 class TestStrategySelection:
@@ -338,7 +400,9 @@ class TestDirectStart:
         await env.start(force_build=False)
 
         sdk.Image.from_dockerfile.aio.assert_awaited_once_with(
-            env.environment_dir / "Dockerfile", context_dir=env.environment_dir
+            env.environment_dir / "Dockerfile",
+            context_dir=env.environment_dir,
+            registry_logins=None,
         )
         sdk.image.build.aio.assert_not_awaited()
         sdk.App.find.aio.assert_awaited_once_with("harbor", mint_if_missing=True)
@@ -346,7 +410,7 @@ class TestDirectStart:
             app="app-handle",
             image=sdk.image,
             name="Test.Session.123",
-            size="m",
+            vcpu_count=4,
             memory_limit_gib=40,
             disk_limit_gib=None,
             max_lifetime_seconds=None,
@@ -410,7 +474,9 @@ class TestDirectStart:
 
         await env.start(force_build=False)
 
-        sdk.Image.from_registry.assert_called_once_with("ubuntu:22.04")
+        sdk.Image.from_registry.assert_called_once_with(
+            "ubuntu:22.04", username=None, password=None
+        )
         sdk.Image.from_dockerfile.aio.assert_not_awaited()
         assert sdk.Sailbox.create.aio.await_args.kwargs["image"] is sdk.image
         # The task's loose environment files travel with a prebuilt image.

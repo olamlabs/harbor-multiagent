@@ -1956,7 +1956,7 @@ requires-dist = [
     { name = "rich", specifier = ">=14.1.0" },
     { name = "runloop-api-client", marker = "extra == 'runloop'", specifier = ">=1.23.2" },
     { name = "runta-sdk", marker = "extra == 'runta'", specifier = ">=0.2.5,<0.3.0" },
-    { name = "sail", marker = "extra == 'sail'", specifier = ">=0.13.0" },
+    { name = "sail", marker = "extra == 'sail'", specifier = ">=0.18.1" },
     { name = "semver", specifier = ">=3.0.4" },
     { name = "shortuuid", specifier = ">=1.0.13" },
     { name = "skypilot-nightly", marker = "extra == 'skypilot'", specifier = ">=0.10.0" },
@@ -5311,18 +5311,18 @@ wheels = [
 
 [[package]]
 name = "sail"
-version = "0.13.0"
+version = "0.18.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cloudpickle" },
     { name = "protobuf" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/9a/3dfb41b7c64c3faaccfbe9072adfb5b50aa453d5b587f6ab154a707616d8/sail-0.13.0-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:8a80b118620b98dc3b61e05d16c0f10c4cb3533a91b97ba53f666dd55ce320c3", size = 15966486, upload-time = "2026-10-08T02:30:36.293Z" },
-    { url = "https://files.pythonhosted.org/packages/75/6a/cae6bf62acd655ca8dd915b03f3064ece477325413f35a9e422fe727bd1c/sail-0.13.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:f5a4793d7ced08a1ce4fc4fe513a11e15ecdf0661a944f3f6d2411b769fad6a4", size = 15209381, upload-time = "2026-10-08T02:30:43.112Z" },
-    { url = "https://files.pythonhosted.org/packages/16/31/7b1aebb2fd7a5a4674e2c9706d1e24c3c76bf61e36b8e99ee56eb56c1a6a/sail-0.13.0-cp39-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:ee48e049df91c8922d8e1be06c30c20e87ea3745b7dcfbda52ed4ef385fd10df", size = 17112107, upload-time = "2026-10-08T02:30:46.074Z" },
-    { url = "https://files.pythonhosted.org/packages/03/88/0ce263a9f4a2bc7d41a57da7b2513614347eea164588cb8243f8da08663c/sail-0.13.0-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:75e021e867ef286bcbb639022ded973dc05ef3fc6df0ed583d95c5505f83888b", size = 16867730, upload-time = "2026-10-08T02:30:49.312Z" },
-    { url = "https://files.pythonhosted.org/packages/ae/95/c4610bc64d0fb1b0d060792cbc64484231438f52395de15e74a89659fdfb/sail-0.13.0-cp39-abi3-win_amd64.whl", hash = "sha256:d67b5585f779f3a545acfa744a718be30139d9c1f4c5cb7953cadeea1a4bb4cd", size = 13623948, upload-time = "2026-10-08T02:30:52.246Z" },
+    { url = "https://files.pythonhosted.org/packages/7a/47/1b9366367e82c825661090225dcb6015d4542eb15c2d9f61715716400c5d/sail-0.18.1-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:a3fbd49970da79265cca8427fde9ea573fc5d30ad4fabbd20c6ecb633059fb9b", size = 17033085, upload-time = "2026-11-09T21:07:51.858Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/2f/2130e9c5058b0f75e065ee4218eb482d5b181173f057349d7c6f2d357e92/sail-0.18.1-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:127736ea406b3cfd7f86cae1e903ba7e5ef8a75b26985422e4ce2a67196dfa7e", size = 16211693, upload-time = "2026-11-09T21:07:54.371Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/ff/574f34cc40f951bba4314febb169745417dca0145dc8418dbd194ead6974/sail-0.18.1-cp39-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d9d5995f4944d06b1037f9d56f72cb5eb72bf2cac97a68c5fb9ceee068906065", size = 18213830, upload-time = "2026-11-09T21:07:56.941Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/d1/2a9470ee9b7d96fc2feb7c61c8260e2d703479032cf1dc31469e68f8e0ba/sail-0.18.1-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:35342da079b155b17a7bdbcaab953db026e4d5bbed57970c5aff6e8e551643ae", size = 17971707, upload-time = "2026-11-09T21:07:59.522Z" },
+    { url = "https://files.pythonhosted.org/packages/28/8e/560f5956a80411d5ba5767106c7db5d0ff72ad08433859ebe68f1ba00d38/sail-0.18.1-cp39-abi3-win_amd64.whl", hash = "sha256:0d19853a9b44f66eba2403f5ddb1b86bb2371bc5132b88aac373b2f8e21eeaf8", size = 14608883, upload-time = "2026-11-09T21:08:01.872Z" },
 ]
 
 [[package]]
