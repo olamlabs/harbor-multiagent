@@ -328,7 +328,7 @@ class TestRegistryLogins:
 
         await env.start(force_build=False)
 
-        assert "registry_logins" not in sdk.Image.from_compose.aio.await_args.kwargs
+        assert sdk.Image.from_compose.aio.await_args.kwargs["registry_logins"] is None
 
 
 class TestStrategySelection:
@@ -400,7 +400,9 @@ class TestDirectStart:
         await env.start(force_build=False)
 
         sdk.Image.from_dockerfile.aio.assert_awaited_once_with(
-            env.environment_dir / "Dockerfile", context_dir=env.environment_dir
+            env.environment_dir / "Dockerfile",
+            context_dir=env.environment_dir,
+            registry_logins=None,
         )
         sdk.image.build.aio.assert_not_awaited()
         sdk.App.find.aio.assert_awaited_once_with("harbor", mint_if_missing=True)
@@ -472,7 +474,9 @@ class TestDirectStart:
 
         await env.start(force_build=False)
 
-        sdk.Image.from_registry.assert_called_once_with("ubuntu:22.04")
+        sdk.Image.from_registry.assert_called_once_with(
+            "ubuntu:22.04", username=None, password=None
+        )
         sdk.Image.from_dockerfile.aio.assert_not_awaited()
         assert sdk.Sailbox.create.aio.await_args.kwargs["image"] is sdk.image
         # The task's loose environment files travel with a prebuilt image.

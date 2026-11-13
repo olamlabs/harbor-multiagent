@@ -212,17 +212,14 @@ class _SailDirect(_SailStrategy):
             )
             image = Image.from_registry(
                 docker_image,
-                **(
-                    {"username": login.username, "password": login.password}
-                    if login
-                    else {}
-                ),
+                username=login.username if login else None,
+                password=login.password if login else None,
             )
         else:
             image = await Image.from_dockerfile.aio(
                 env.environment_dir / "Dockerfile",
                 context_dir=env.environment_dir,
-                **env._registry_logins_kwarg(),
+                registry_logins=env._registry_logins or None,
             )
             if force_build:
                 image = await image.build.aio(
@@ -510,7 +507,7 @@ class _SailDinD(DinDComposeOps, _SailStrategy):
             ],
             env={**self._user_env_vars(), **self._infra_env_vars(".")},
             project_name=self._PROJECT_NAME,
-            **self._env._registry_logins_kwarg(),
+            registry_logins=self._env._registry_logins or None,
         )
 
     @override
@@ -702,13 +699,6 @@ class SailEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     @property
     def _build_timeout_sec(self) -> int:
         return round(self.task_env_config.build_timeout_sec)
-
-    def _registry_logins_kwarg(self) -> dict[str, list[RegistryLogin]]:
-        """The ``registry_logins`` argument for an image build, when there
-        are logins to pass."""
-        return (
-            {"registry_logins": self._registry_logins} if self._registry_logins else {}
-        )
 
     def _require_sailbox(self) -> Sailbox:
         if not self._sailbox:
