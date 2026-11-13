@@ -157,9 +157,27 @@ class _FileStream:
             raise self._error
 
 
-def _compose_up_failure(**fields) -> Exception:
-    """The error ``sail.Sailbox.compose_up`` raises for a failed start."""
-    return sail_mod.CommandFailedError("compose failed", result=_run_result(**fields))
+def _compose_commands(sdk: SimpleNamespace) -> list[list[str]]:
+    """Each ``docker compose`` command run on the VM, from its subcommand on."""
+    commands = []
+    for call in sdk.sailbox.run.aio.await_args_list:
+        argv = call.args[0]
+        if argv[:2] != ["/usr/bin/docker", "compose"]:
+            continue
+        start = min(
+            argv.index(name) for name in ("build", "up", "exec") if name in argv
+        )
+        commands.append(argv[start:])
+    return commands
+
+
+def _fail_when(sdk: SimpleNamespace, matches, **fields) -> None:
+    """Make the VM commands ``matches`` accepts fail, and the rest succeed."""
+
+    async def run(argv, **kwargs):
+        return _run_result(**fields) if matches(argv) else _run_result()
+
+    sdk.sailbox.run.aio.side_effect = run
 
 
 @pytest.fixture
@@ -168,7 +186,6 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     sailbox = MagicMock()
     sailbox.sailbox_id = "sbx_123"
     sailbox.run.aio = AsyncMock(return_value=_run_result())
-    sailbox.compose_up.aio = AsyncMock(return_value=_run_result())
     sailbox.set_egress_policy.aio = AsyncMock()
     sailbox.terminate.aio = AsyncMock()
     sailbox.sleep.aio = AsyncMock()
@@ -182,7 +199,6 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     image_cls = MagicMock()
     image_cls.from_registry.return_value = image
     image_cls.from_dockerfile.aio = AsyncMock(return_value=image)
-    image_cls.from_compose.aio = AsyncMock(return_value=image)
     app_cls = MagicMock()
     app_cls.find.aio = AsyncMock(return_value="app-handle")
     sailbox_cls = MagicMock()
@@ -301,14 +317,21 @@ class TestRegistryLogins:
         ]
         assert all(login.password is not None for login in logins)
 
-    @pytest.mark.parametrize("compose", [False, True])
-    async def test_image_builds_get_the_logins(self, temp_dir, sdk, compose):
-        env = self._env(temp_dir, compose=compose)
+    async def test_an_image_build_gets_the_logins(self, temp_dir, sdk):
+        env = self._env(temp_dir)
 
         await env.start(force_build=False)
 
-        build = sdk.Image.from_compose.aio if compose else sdk.Image.from_dockerfile.aio
-        assert build.await_args.kwargs["registry_logins"] == env._registry_logins
+        build = sdk.Image.from_dockerfile.aio.await_args.kwargs
+        assert build["registry_logins"] == env._registry_logins
+
+    async def test_a_compose_vm_gets_the_docker_config(self, temp_dir, sdk):
+        env = self._env(temp_dir, compose=True)
+
+        await env.start(force_build=False)
+
+        uploaded = [call.args[0] for call in sdk.sailbox.fs.write.aio.await_args_list]
+        assert "/root/.docker/config.json" in uploaded
 
     async def test_a_prebuilt_image_is_pulled_with_its_registry_login(
         self, temp_dir, sdk
@@ -328,7 +351,8 @@ class TestRegistryLogins:
 
         await env.start(force_build=False)
 
-        assert sdk.Image.from_compose.aio.await_args.kwargs["registry_logins"] is None
+        uploaded = [call.args[0] for call in sdk.sailbox.fs.write.aio.await_args_list]
+        assert "/root/.docker/config.json" not in uploaded
 
 
 class TestStrategySelection:
@@ -372,15 +396,33 @@ class TestNetworkPolicy:
         with pytest.raises(ValueError, match="IPv6"):
             _make_env(temp_dir, phase_network_policies=[policy])
 
-    @pytest.mark.parametrize("compose", [False, True])
-    async def test_start_creates_under_the_policy(self, temp_dir, sdk, compose):
-        env = _make_env(temp_dir, compose=compose, network_policy=NO_NETWORK)
+    async def test_start_creates_under_the_policy(self, temp_dir, sdk):
+        env = _make_env(temp_dir, network_policy=NO_NETWORK)
 
         await env.start(force_build=False)
 
         assert sdk.Sailbox.create.aio.await_args.kwargs["egress_policy"] == {
             "no_network": True
         }
+        sdk.sailbox.set_egress_policy.aio.assert_not_awaited()
+
+    async def test_a_compose_vm_gets_the_policy_once_its_services_are_up(
+        self, temp_dir, sdk
+    ):
+        env = _make_env(temp_dir, compose=True, network_policy=NO_NETWORK)
+
+        await env.start(force_build=False)
+
+        assert sdk.Sailbox.create.aio.await_args.kwargs["egress_policy"] == {}
+        sdk.sailbox.set_egress_policy.aio.assert_awaited_once_with({"no_network": True})
+
+    async def test_a_compose_vm_with_public_network_keeps_its_policy(
+        self, temp_dir, sdk
+    ):
+        env = _make_env(temp_dir, compose=True)
+
+        await env.start(force_build=False)
+
         sdk.sailbox.set_egress_policy.aio.assert_not_awaited()
 
     async def test_set_network_policy_switches_egress(self, temp_dir, sdk):
@@ -421,11 +463,8 @@ class TestDirectStart:
         sdk.sailbox.fs.mkdir.aio.assert_not_awaited()
         sdk.sailbox.run.aio.assert_not_awaited()
 
-    @pytest.mark.parametrize("compose", [False, True])
-    async def test_force_build_creates_from_the_rebuilt_image(
-        self, temp_dir, sdk, compose
-    ):
-        env = _make_env(temp_dir, compose=compose)
+    async def test_force_build_creates_from_the_rebuilt_image(self, temp_dir, sdk):
+        env = _make_env(temp_dir)
         built = MagicMock()
         sdk.image.build.aio.return_value = built
 
@@ -838,39 +877,23 @@ class TestDinDResourcesOverride:
 
 
 class TestDinDStart:
-    async def test_builds_project_image_and_starts_services(self, temp_dir, sdk):
+    async def test_builds_and_starts_the_project_in_the_vm(self, temp_dir, sdk):
         extra = temp_dir / "extra.yaml"
         extra.write_text("services:\n  sidecar:\n    image: redis:7\n")
         env = _make_env(temp_dir, compose=True, extra_docker_compose=[extra])
 
         await env.start(force_build=False)
 
-        sdk.Image.from_compose.aio.assert_awaited_once()
-        (project_dir,), build = sdk.Image.from_compose.aio.await_args
-        assert project_dir == env.environment_dir
-        assert build["files"] == [
-            sail_mod.COMPOSE_BUILD_PATH,
-            env.environment_dir / "docker-compose.yaml",
-            *env.extra_docker_compose_paths,
+        # The VM boots an image that has Docker, and builds, pulls and starts
+        # the project itself.
+        sdk.Image.devbox.assert_called_once_with("amd64")
+        create = sdk.Sailbox.create.aio.await_args.kwargs
+        assert create["image"] is sdk.Image.devbox.return_value
+        assert _compose_commands(sdk) == [
+            ["build"],
+            ["up", "-d"],
+            ["exec", "-T", "main", "true"],
         ]
-        assert build["project_name"] == "harbor"
-        sdk.image.build.aio.assert_not_awaited()
-        assert sdk.Sailbox.create.aio.await_args.kwargs["image"] is sdk.image
-
-        # The start only runs the project's containers: nothing is built or
-        # pulled on the VM.
-        sdk.sailbox.compose_up.aio.assert_awaited_once_with(
-            project_dir="/harbor/environment",
-            files=_dind(env)._compose_files(),
-            project_name="harbor",
-            env=_dind(env)._compose_env_vars(),
-            timeout=600,
-        )
-        sdk.sailbox.run.aio.assert_not_awaited()
-        # The build runs under the VM's compose environment, with the build
-        # context relative to the project directory.
-        up = sdk.sailbox.compose_up.aio.await_args.kwargs["env"]
-        assert build["env"] == {**up, "CONTEXT_DIR": "."}
         uploaded = {call.args[0] for call in sdk.sailbox.fs.write.aio.await_args_list}
         assert uploaded == {
             f"/harbor/compose/{sail_mod.COMPOSE_BUILD_PATH.name}",
@@ -890,42 +913,26 @@ class TestDinDStart:
 
         await env.start(force_build=False)
 
-        assert sdk.Image.from_compose.aio.await_args.kwargs["files"] == [
-            sail_mod.COMPOSE_BUILD_PATH,
-            *env.extra_docker_compose_paths,
-        ]
         paths = _dind(env)._compose_files()
         assert "/harbor/environment/docker-compose.yaml" not in paths
         assert "/harbor/compose/docker-compose-extra-0.yaml" in paths
 
-    async def test_prebuilt_image_submits_the_prebuilt_file(self, temp_dir, sdk):
+    async def test_prebuilt_image_uses_the_prebuilt_file(self, temp_dir, sdk):
         env = _make_env(temp_dir, compose=True, docker_image="python:3.12")
 
         await env.start(force_build=False)
 
-        build = sdk.Image.from_compose.aio.await_args.kwargs
-        assert build["files"][0] == sail_mod.COMPOSE_PREBUILT_PATH
-        assert build["env"]["PREBUILT_IMAGE_NAME"] == "python:3.12"
+        assert _dind(env)._compose_env_vars()["PREBUILT_IMAGE_NAME"] == "python:3.12"
         paths = _dind(env)._compose_files()
         assert f"/harbor/compose/{sail_mod.COMPOSE_PREBUILT_PATH.name}" in paths
         assert f"/harbor/compose/{sail_mod.COMPOSE_BUILD_PATH.name}" not in paths
 
-    async def test_up_failure_terminates_sailbox(self, temp_dir, sdk):
+    @pytest.mark.parametrize("step", ["build", "up"])
+    async def test_build_or_up_failure_terminates_sailbox(self, temp_dir, sdk, step):
         env = _make_env(temp_dir, compose=True)
-        sdk.sailbox.compose_up.aio.side_effect = _compose_up_failure(
-            exit_code=1, stderr="no such image"
-        )
+        _fail_when(sdk, lambda argv: step in argv, exit_code=1, stderr="no such image")
 
-        with pytest.raises(RuntimeError, match="compose up failed.*no such image"):
-            await env.start(force_build=False)
-
-        sdk.sailbox.terminate.aio.assert_awaited_once()
-
-    async def test_up_timeout_terminates_sailbox(self, temp_dir, sdk):
-        env = _make_env(temp_dir, compose=True)
-        sdk.sailbox.compose_up.aio.side_effect = _compose_up_failure(timed_out=True)
-
-        with pytest.raises(RuntimeError, match="compose up timed out after 600"):
+        with pytest.raises(RuntimeError, match=f"compose {step} failed.*no such image"):
             await env.start(force_build=False)
 
         sdk.sailbox.terminate.aio.assert_awaited_once()
@@ -935,8 +942,7 @@ class TestDinDStart:
 
         await env.start(force_build=False)
 
-        sdk.sailbox.compose_up.aio.assert_awaited_once()
-        (mkdir,) = (call.args[0] for call in sdk.sailbox.run.aio.await_args_list)
+        mkdir = sdk.sailbox.run.aio.await_args_list[-1].args[0]
         assert mkdir[:2] == ["/usr/bin/docker", "compose"]
         assert mkdir[-10:] == [
             "exec",
@@ -970,17 +976,21 @@ class TestDinDStart:
         assert override["services"]["main"]["volumes"] == [
             {"type": "bind", "source": "/logs/agent", "target": "/logs/agent"}
         ]
-        (host_setup,) = (call.args[0] for call in sdk.sailbox.run.aio.await_args_list)
-        assert host_setup[-1] == "mkdir -p /logs/agent && chmod 777 /logs/agent"
-        sdk.sailbox.compose_up.aio.assert_awaited_once()
+        host_commands = [
+            call.args[0][-1] for call in sdk.sailbox.run.aio.await_args_list
+        ]
+        assert "mkdir -p /logs/agent && chmod 777 /logs/agent" in host_commands
         sdk.sailbox.fs.download_dir.aio.assert_awaited_once_with(
             "/logs/agent", temp_dir / "agent"
         )
 
     async def test_workdir_failure_terminates_sailbox(self, temp_dir, sdk):
         env = _make_env(temp_dir, compose=True, workdir="/app")
-        sdk.sailbox.run.aio.return_value = _run_result(
-            1, stderr="read-only file system"
+        _fail_when(
+            sdk,
+            lambda argv: argv[-1] == "mkdir -p /app",
+            exit_code=1,
+            stderr="read-only file system",
         )
 
         with pytest.raises(RuntimeError, match="/app.*read-only file system"):

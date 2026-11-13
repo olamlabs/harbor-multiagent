@@ -2,11 +2,12 @@
 
 Each trial runs on a Sailbox, a microVM from Sail
 (https://docs.sailresearch.com/sailboxes). Single-container tasks run
-directly in the VM from the task's Dockerfile or ``docker_image``. For a
-Docker Compose task, Sail builds the project's service images into the VM's
-image, and ``docker compose`` starts them inside the VM. Network policies map
-onto Sail's egress policy, which covers the whole VM in both modes and applies
-from the moment the VM is created.
+directly in the VM from the task's Dockerfile or ``docker_image``. A Docker
+Compose task runs on a VM that has Docker: ``docker compose`` builds and
+starts the project inside the VM, as the other cloud environments do. Network
+policies map onto Sail's egress policy, which covers the whole VM in both
+modes. A single-container VM has it from creation; a Compose VM has it once
+its services are up, since building and pulling need the network.
 """
 
 from __future__ import annotations
@@ -64,7 +65,6 @@ from harbor.utils.optional_import import MissingExtraError
 try:
     from sail import (
         App,
-        CommandFailedError,
         Config,
         EgressPolicy,
         Image,
@@ -260,9 +260,10 @@ class _SailDirect(_SailStrategy):
 class _SailDinD(DinDComposeOps, _SailStrategy):
     """Docker Compose strategy for multi-container tasks.
 
-    Sail builds the project's service images ahead of time and stores them in
-    the Sailbox image, whose Docker daemon starts at boot, so nothing is built
-    or pulled inside the VM.
+    The Sailbox boots Sail's devbox image, which has Docker, and ``docker
+    compose`` builds and pulls the project's images inside the VM. Any image
+    reference Docker takes works, and private images are pulled with the
+    Docker login in ``docker_config_path``.
 
     Topology:
         Local machine (harbor CLI)
@@ -487,28 +488,29 @@ class _SailDinD(DinDComposeOps, _SailStrategy):
                 f"Failed to create the working directory {workdir}: {result.stderr}"
             )
 
-    async def _image_definition(self) -> ImageDefinition:
-        """Define the Sailbox image that holds the project's service images.
+    async def _wait_for_docker(self) -> None:
+        """Wait for the VM's Docker daemon, which starts at boot, to answer."""
+        async with asyncio.timeout(self._env._build_timeout_sec):
+            while (await self._host_exec("docker info")).return_code != 0:
+                await asyncio.sleep(1)
 
-        The build gets the compose files that decide those images, in the
-        order compose reads them on the VM: Harbor's build or prebuilt file,
-        the task's compose file, then the extra compose files. The task's
-        environment directory is the project directory, so the build context
-        is relative to it. The SDK sends the build only the variables those
-        files read to choose an image; the rest, such as a secret in a
-        service's ``environment``, reach compose only on the VM. The
-        resources, env, and mounts overrides are added only on the VM.
-        """
-        return await Image.from_compose.aio(
-            self._env.environment_dir,
-            files=[
-                self._build_or_prebuilt_path,
-                *(path for _, path in self._task_compose_files()),
-            ],
-            env={**self._user_env_vars(), **self._infra_env_vars(".")},
-            project_name=self._PROJECT_NAME,
-            registry_logins=self._env._registry_logins or None,
-        )
+    async def _wait_for_main_container(self) -> None:
+        """Wait for the main service to take commands."""
+        async with asyncio.timeout(self._env._build_timeout_sec):
+            while (
+                await self._compose_exec(["exec", "-T", MAIN_SERVICE_NAME, "true"])
+            ).return_code != 0:
+                await asyncio.sleep(1)
+
+    async def _stage_docker_login(self) -> None:
+        """Give the VM's Docker the logins in ``docker_config_path``, as the
+        local docker environment uses the host's."""
+        config = self._env._docker_config_path
+        if not config:
+            return
+        home = (await self._host_exec('printf %s "$HOME"')).stdout or "/root"
+        await self._host_exec(f"mkdir -p {shlex.quote(home)}/.docker")
+        await self._env._sdk_upload_file(config, f"{home}/.docker/config.json")
 
     @override
     async def start(self, force_build: bool) -> None:
@@ -519,13 +521,13 @@ class _SailDinD(DinDComposeOps, _SailStrategy):
             docker_image=env.task_env_config.docker_image,
             force_build=force_build,
         )
-        image = await self._image_definition()
-        if force_build:
-            image = await image.build.aio(
-                force_build=True, timeout=env._build_timeout_sec
-            )
-
-        await env._create_sailbox(image)
+        # Building and pulling need the network, so the VM starts open and
+        # gets the task's policy once its services are up.
+        await env._create_sailbox(
+            Image.devbox("amd64"), egress_policy=EgressPolicy.allow_all()
+        )
+        await self._wait_for_docker()
+        await self._stage_docker_login()
 
         await env._sdk_upload_file(
             self._build_or_prebuilt_path,
@@ -547,24 +549,26 @@ class _SailDinD(DinDComposeOps, _SailStrategy):
             quoted = shlex.join(bind_sources)
             await self._host_exec(f"mkdir -p {quoted} && chmod 777 {quoted}")
 
-        # The service images are already loaded, but the Docker daemon may still
-        # be starting. compose_up waits for it to answer before running up.
-        env.logger.debug("Starting compose services inside the Sailbox...")
-        try:
-            await env._require_sailbox().compose_up.aio(
-                project_dir=self._ENVIRONMENT_DIR,
-                files=self._compose_files(),
-                project_name=self._PROJECT_NAME,
-                env=self._compose_env_vars(),
-                timeout=env._build_timeout_sec,
-            )
-        except CommandFailedError as e:
-            result = e.result
+        env.logger.debug("Building compose services inside the Sailbox...")
+        result = await self._compose_exec(["build"], timeout_sec=env._build_timeout_sec)
+        if result.return_code != 0:
             raise RuntimeError(
-                f"docker compose up timed out after {env._build_timeout_sec} seconds"
-                if result.timed_out
-                else f"docker compose up failed: {result.stdout} {result.stderr}"
-            ) from None
+                f"docker compose build failed: {result.stdout} {result.stderr}"
+            )
+
+        env.logger.debug("Starting compose services inside the Sailbox...")
+        result = await self._compose_exec(
+            ["up", "-d"], timeout_sec=env._build_timeout_sec
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                f"docker compose up failed: {result.stdout} {result.stderr}"
+            )
+        await self._wait_for_main_container()
+
+        policy = env._to_egress_policy(env.network_policy)
+        if policy != EgressPolicy.allow_all():
+            await env._require_sailbox().set_egress_policy.aio(policy)
 
         await self._ensure_main_workdir()
         await env._upload_environment_dir_after_start()
@@ -664,8 +668,10 @@ class SailEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             max_lifetime_seconds: Seconds after creation at which Sail terminates
                 the Sailbox, even if Harbor never stops it. Default is no limit.
             docker_config_path: A Docker ``config.json`` whose registry logins
-                Sail's image builds use to pull private images, as the local
-                docker environment uses the host's login. Default is none.
+                pull private images, as the local docker environment uses the
+                host's login: Sail's image build gets them for a
+                single-container task, and the VM's Docker for a Compose
+                task. Default is none.
             extra_docker_compose: Additional compose files layered onto the task's
                 compose project. A non-empty list switches the environment to
                 compose mode.
@@ -689,6 +695,7 @@ class SailEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         )
         self._app_name = app_name
         self._max_lifetime_seconds = max_lifetime_seconds
+        self._docker_config_path = docker_config_path
         self._registry_logins = _registry_logins(docker_config_path)
         self._sailbox: Sailbox | None = None
         self._strategy: _SailStrategy = (
@@ -717,11 +724,13 @@ class SailEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
             )
         return EgressPolicy.allow_all()
 
-    async def _create_sailbox(self, image: ImageDefinition) -> None:
+    async def _create_sailbox(
+        self, image: ImageDefinition, *, egress_policy: dict[str, Any] | None = None
+    ) -> None:
         """Create the Sailbox and keep its handle in ``self._sailbox``.
 
-        Sail builds the image outside the VM, so the task's network policy
-        applies from the moment the VM is created.
+        Without ``egress_policy`` the VM gets the task's network policy from
+        the moment it is created.
         """
         cpus = self._effective_cpus
         memory_mb = self._effective_memory_mb
@@ -737,7 +746,9 @@ class SailEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 disk_limit_gib=math.ceil(storage_mb / 1024) if storage_mb else None,
                 max_lifetime_seconds=self._max_lifetime_seconds,
                 image_build_timeout=self._build_timeout_sec,
-                egress_policy=self._to_egress_policy(self.network_policy),
+                egress_policy=self._to_egress_policy(self.network_policy)
+                if egress_policy is None
+                else egress_policy,
             )
         )
         # Shield the create and, after a cancellation, give it 30 seconds to
