@@ -12,6 +12,8 @@ from the moment the VM is created.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import math
 import os
 import re
@@ -67,7 +69,9 @@ try:
         EgressPolicy,
         Image,
         ImageDefinition,
+        RegistryLogin,
         Sailbox,
+        Secret,
     )
 
     _HAS_SAIL = True
@@ -105,6 +109,35 @@ def _bash_argv(command: str, cwd: str | None = None) -> list[str]:
     if cwd:
         command = f"cd {shlex.quote(cwd)} && exec bash -c {shlex.quote(command)}"
     return ["bash", "-c", command]
+
+
+def _registry_logins(docker_config_path: str | Path | None) -> list[RegistryLogin]:
+    """The logins in a Docker ``config.json``, for Sail's image builds.
+
+    Each ``auths`` entry becomes a login for its registry host, with the
+    password sent only with the request that uses it. Docker Hub's entry is
+    keyed by its index URL, which is the registry ``docker.io``.
+    """
+    if not docker_config_path:
+        return []
+    auths = json.loads(Path(docker_config_path).read_text()).get("auths", {})
+    logins = []
+    for registry, entry in auths.items():
+        if entry.get("auth"):
+            username, _, password = (
+                base64.b64decode(entry["auth"]).decode().partition(":")
+            )
+        else:
+            username, password = entry.get("username", ""), entry.get("password", "")
+        host = registry.split("://", 1)[-1].split("/", 1)[0]
+        logins.append(
+            RegistryLogin(
+                "docker.io" if host == "index.docker.io" else host,
+                username=username,
+                password=Secret.ephemeral(password),
+            )
+        )
+    return logins
 
 
 def _referenced_env_names(text: str) -> set[str]:
@@ -168,11 +201,28 @@ class _SailDirect(_SailStrategy):
         if docker_image and should_use_prebuilt_docker_image(
             env.environment_dir, docker_image=docker_image, force_build=force_build
         ):
-            image = Image.from_registry(docker_image)
+            login = max(
+                (
+                    login
+                    for login in env._registry_logins
+                    if docker_image.startswith(f"{login.prefix}/")
+                ),
+                key=lambda login: len(login.prefix),
+                default=None,
+            )
+            image = Image.from_registry(
+                docker_image,
+                **(
+                    {"username": login.username, "password": login.password}
+                    if login
+                    else {}
+                ),
+            )
         else:
             image = await Image.from_dockerfile.aio(
                 env.environment_dir / "Dockerfile",
                 context_dir=env.environment_dir,
+                **env._registry_logins_kwarg(),
             )
             if force_build:
                 image = await image.build.aio(
@@ -460,6 +510,7 @@ class _SailDinD(DinDComposeOps, _SailStrategy):
             ],
             env={**self._user_env_vars(), **self._infra_env_vars(".")},
             project_name=self._PROJECT_NAME,
+            **self._env._registry_logins_kwarg(),
         )
 
     @override
@@ -595,6 +646,7 @@ class SailEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         task_env_config: EnvironmentConfig,
         app_name: str = "harbor",
         max_lifetime_seconds: int | None = None,
+        docker_config_path: str | None = None,
         extra_docker_compose: list[Path] | None = None,
         **kwargs,
     ):
@@ -614,6 +666,9 @@ class SailEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 on first use. Default is "harbor".
             max_lifetime_seconds: Seconds after creation at which Sail terminates
                 the Sailbox, even if Harbor never stops it. Default is no limit.
+            docker_config_path: A Docker ``config.json`` whose registry logins
+                Sail's image builds use to pull private images, as the local
+                docker environment uses the host's login. Default is none.
             extra_docker_compose: Additional compose files layered onto the task's
                 compose project. A non-empty list switches the environment to
                 compose mode.
@@ -637,6 +692,7 @@ class SailEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         )
         self._app_name = app_name
         self._max_lifetime_seconds = max_lifetime_seconds
+        self._registry_logins = _registry_logins(docker_config_path)
         self._sailbox: Sailbox | None = None
         self._strategy: _SailStrategy = (
             _SailDinD(self) if self._compose_mode else _SailDirect(self)
@@ -646,6 +702,13 @@ class SailEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
     @property
     def _build_timeout_sec(self) -> int:
         return round(self.task_env_config.build_timeout_sec)
+
+    def _registry_logins_kwarg(self) -> dict[str, list[RegistryLogin]]:
+        """The ``registry_logins`` argument for an image build, when there
+        are logins to pass."""
+        return (
+            {"registry_logins": self._registry_logins} if self._registry_logins else {}
+        )
 
     def _require_sailbox(self) -> Sailbox:
         if not self._sailbox:

@@ -1,6 +1,7 @@
 """Unit tests for SailEnvironment."""
 
 import asyncio
+import base64
 import json
 import logging
 import sys
@@ -259,6 +260,75 @@ class TestSizeSelection:
             kwargs["memory_limit_gib"],
             kwargs["disk_limit_gib"],
         ) == expected
+
+
+class TestRegistryLogins:
+    @staticmethod
+    def _docker_config(temp_dir: Path) -> Path:
+        path = temp_dir / "config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "auths": {
+                        "ghcr.io": {
+                            "auth": base64.b64encode(b"octocat:t0ken").decode()
+                        },
+                        "https://index.docker.io/v1/": {
+                            "username": "hubuser",
+                            "password": "hubpass",
+                        },
+                    }
+                }
+            )
+        )
+        return path
+
+    def _env(self, temp_dir: Path, **kwargs) -> SailEnvironment:
+        return _make_env(
+            temp_dir,
+            environment_kwargs={
+                "docker_config_path": str(self._docker_config(temp_dir))
+            },
+            **kwargs,
+        )
+
+    def test_reads_each_login_in_a_docker_config(self, temp_dir):
+        logins = self._env(temp_dir)._registry_logins
+
+        assert [(login.prefix, login.username) for login in logins] == [
+            ("ghcr.io", "octocat"),
+            ("docker.io", "hubuser"),
+        ]
+        assert all(login.password is not None for login in logins)
+
+    @pytest.mark.parametrize("compose", [False, True])
+    async def test_image_builds_get_the_logins(self, temp_dir, sdk, compose):
+        env = self._env(temp_dir, compose=compose)
+
+        await env.start(force_build=False)
+
+        build = sdk.Image.from_compose.aio if compose else sdk.Image.from_dockerfile.aio
+        assert build.await_args.kwargs["registry_logins"] == env._registry_logins
+
+    async def test_a_prebuilt_image_is_pulled_with_its_registry_login(
+        self, temp_dir, sdk
+    ):
+        env = self._env(temp_dir, docker_image="ghcr.io/acme/app:1")
+
+        await env.start(force_build=False)
+
+        sdk.Image.from_registry.assert_called_once_with(
+            "ghcr.io/acme/app:1",
+            username="octocat",
+            password=env._registry_logins[0].password,
+        )
+
+    async def test_no_config_passes_no_logins(self, temp_dir, sdk):
+        env = _make_env(temp_dir, compose=True)
+
+        await env.start(force_build=False)
+
+        assert "registry_logins" not in sdk.Image.from_compose.aio.await_args.kwargs
 
 
 class TestStrategySelection:
