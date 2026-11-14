@@ -21,7 +21,7 @@ env:
 jobs:
   non-runtime-linux:
     name: Non-runtime (ubuntu-26.04)
-    runs-on: blacksmith-8vcpu-ubuntu-2604
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps: &non-runtime-steps
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -68,13 +68,13 @@ jobs:
 
   non-runtime-windows:
     name: Non-runtime (windows-2025)
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: windows-2025
     timeout-minutes: 15
     steps: *non-runtime-steps
 
   runtime:
     name: Runtime (${{ matrix.suite }})
-    runs-on: blacksmith-${{ matrix.cpus }}vcpu-ubuntu-2604
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -199,7 +199,7 @@ jobs:
 
   windows-containers:
     name: Windows containers
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -237,7 +237,7 @@ jobs:
     name: test (ubuntu-latest)
     if: ${{ !cancelled() }}
     needs: [non-runtime-linux, runtime]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - name: Check results
         env:
@@ -248,7 +248,7 @@ jobs:
     name: test (windows-2025)
     if: ${{ !cancelled() }}
     needs: [non-runtime-windows, windows-containers]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - name: Check results
         env:
