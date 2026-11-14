@@ -9,7 +9,7 @@ several Harbor agents in one environment, each in its own Compose service
 
 | File | Why |
 |---|---|
-| `.github/workflows/*.yml` | Harbor runs its CI on Blacksmith runners (`blacksmith-<n>vcpu-<os>` labels), which only a repository with the Blacksmith GitHub App installed can use; this repository does not have it, so those jobs would wait in the queue and never start. Each job runs on the GitHub-hosted runner of the same OS instead (`ubuntu-26.04`, `ubuntu-24.04`, `windows-2025`); the steps are Harbor's. Tradeoff: GitHub's standard runners have fewer CPUs and less memory than the Blacksmith sizes Harbor picked, so the suites run slower. |
+| `.github/workflows/*.yml` | Harbor runs its CI on Blacksmith runners (`blacksmith-<n>vcpu-<os>` labels), which only a repository with the Blacksmith GitHub App installed can use; this repository does not have it, so those jobs would wait in the queue and never start. Each job runs on the GitHub-hosted runner of the same OS instead (`ubuntu-26.04`, `ubuntu-24.04`, `windows-2025`); the steps are Harbor's. The `agents` runtime suite's test VM gets 4 CPUs and 12 GB, as Harbor's other two runtime suites do, where Harbor gives it 8 and 24: a GitHub-hosted Linux runner has 4 CPUs and 16 GB, and QEMU fails to start a VM larger than its host. Tradeoff: the suites run slower than on the Blacksmith sizes Harbor picked. |
 | `README.md` | Describes this fork and how to install it. Harbor's README is at [harbor-framework/harbor](https://github.com/harbor-framework/harbor). |
 | `src/harbor/models/task/config.py` | `SeatConfig` and `TaskConfig.agents` (`[agents.<service>]`), with the seat refusals at task load. |
 | `src/harbor/models/task/paths.py` | `seat_instruction_path`: `instructions/<seat>.md`. |
