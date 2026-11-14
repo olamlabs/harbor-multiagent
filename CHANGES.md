@@ -5,6 +5,20 @@ at `6099b8cf`, tagged `original-harbor-base-6099b8cf`, plus multi-agent tasks:
 several Harbor agents in one environment, each in its own Compose service
 (its seat). See [docs-mintlify/tasks/multi-agent.mdx](docs-mintlify/tasks/multi-agent.mdx).
 
+## Harbor commits taken ahead of the base
+
+Cherry-picked from upstream `main` unchanged, in this order, so the E2B environment matches
+upstream's as of `7d9a0b68`:
+
+| Upstream commit | What |
+|---|---|
+| `3095f96e` (#3935) | Keep downloaded logs when tar reports files changed during packing. The E2B commits below import its `tar_transfer` helpers. |
+| `bb20951e` (#3460) | E2B: prebuilt template reuse, create retries, renewable sandbox lease. |
+| `3fd2b440` (#3461) | E2B: content-hash template names, resource-variant tags, launch by build ID. |
+| `1d16afb4` (#3462) | E2B: run as the image user with the image environment and PATH, like `docker exec`. |
+| `4d43ea4d` (#3463) | E2B: tag sandboxes by job and trial, log failed kills. |
+| `7d9a0b68` (#3522) | E2B: `exec()` re-attaches to a running command when its event stream drops, instead of failing the trial. |
+
 ## Harbor files touched
 
 | File | Why |
