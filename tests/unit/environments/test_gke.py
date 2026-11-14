@@ -39,6 +39,11 @@ from harbor.models.task.config import EnvironmentConfig, TpuSpec
 from harbor.models.trial.paths import TrialPaths
 
 
+# Read at collection, before the autouse fixture in tests/unit/conftest.py
+# clears the environment for each test.
+_HOST_ENVIRONMENT = dict(os.environ)
+
+
 async def _start_and_capture_pod(gke_env):
     """Run GKEEnvironment.start() with all external calls mocked and
     return the V1Pod that was passed to create_namespaced_pod.
@@ -1902,7 +1907,11 @@ class TestGKEDinDSSH:
         )
 
     @pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
-    async def test_ssh_command_pins_the_pod_host_key(self, temp_dir):
+    async def test_ssh_command_pins_the_pod_host_key(self, temp_dir, monkeypatch):
+        # ssh-keygen runs as a host program, with the host's environment;
+        # Windows' OpenSSH fails without its system variables.
+        for name, value in _HOST_ENVIRONMENT.items():
+            monkeypatch.setenv(name, value)
         env = _make_gke_compose_env(temp_dir)
         dind = env._dind
         authorized_key, host_key = await dind._create_ssh_keys()
