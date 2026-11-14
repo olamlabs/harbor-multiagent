@@ -418,11 +418,14 @@ async def test_agent_timeout_ends_everyone_still_running_and_still_grades(
 
 
 @pytest.mark.parametrize(
-    "fail, error",
-    [("exit", "NonZeroAgentExitCodeError"), ("auth", "AgentAuthenticationError")],
+    "fail, error, graded",
+    [
+        ("exit", "NonZeroAgentExitCodeError", True),
+        ("auth", "AgentAuthenticationError", False),
+    ],
 )
-async def test_an_agent_failure_reaches_the_trial_and_job_stats_and_still_grades(
-    tmp_path: Path, fail: str, error: str
+async def test_an_agent_failure_reaches_the_trial_and_job_stats_and_grades_by_policy(
+    tmp_path: Path, fail: str, error: str, graded: bool
 ):
     trial = await _seats_trial(
         _config(
@@ -442,7 +445,7 @@ async def test_an_agent_failure_reaches_the_trial_and_job_stats_and_still_grades
     assert result.exception_info.exception_message.startswith("Seat 'maya': ")
     assert "Seat 'maya'" in trial.paths.exception_message_path.read_text()
     assert ("ended", "raj") in EVENTS and ("stopped", "lee") in EVENTS
-    assert _verified(trial)
+    assert _verified(trial) is graded
     stats = JobStats()
     stats.increment(result)
     assert stats.n_errored_trials == 1
@@ -533,7 +536,7 @@ async def test_install_only_sets_up_every_seat_and_plays_none(tmp_path: Path):
 SCRUBBED = {seat: f"{seat}-value-to-scrub" for seat in ("maya", "raj")}
 
 
-async def test_secrets_of_every_seat_are_scrubbed_in_one_pass(
+async def test_secrets_of_every_seat_are_scrubbed_in_each_pass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     from harbor.trial import trial as trial_module
@@ -561,7 +564,7 @@ async def test_secrets_of_every_seat_are_scrubbed_in_one_pass(
     for seat, secret in SCRUBBED.items():
         log = trial.paths.trial_dir / "seats" / seat / "agent" / "log.txt"
         assert secret not in log.read_text()
-        assert calls.count(log) == 1
+        assert calls.count(log) == 2
 
 
 async def test_result_json_records_every_seat(tmp_path: Path):

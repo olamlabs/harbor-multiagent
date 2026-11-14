@@ -191,6 +191,10 @@ class SeatsTrial(SingleStepTrial):
     @override
     def _init_result(self) -> None:
         super()._init_result()
+        # A seat trial runs its participants; the default `agent` never runs.
+        self.paths.config_path.write_text(
+            self.config.model_dump_json(indent=4, exclude={"agent"})
+        )
         self.result.seat_results = [seat.result for seat in self.seats]
 
     @override

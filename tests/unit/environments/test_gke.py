@@ -1449,8 +1449,14 @@ class TestGKEDinDPodSpec:
 
     def test_compose_up_timeout_kwarg(self, temp_dir):
         env = _make_gke_compose_env(temp_dir, compose_up_timeout_sec=900)
-        assert env._kwargs["compose_up_timeout_sec"] == 900
-        assert "compose_up_timeout_sec" not in _make_gke_compose_env(temp_dir)._kwargs
+        assert env.options.compose_up_timeout_sec == 900
+        assert _make_gke_compose_env(temp_dir).options.compose_up_timeout_sec is None
+        assert (
+            _make_gke_compose_env(
+                temp_dir, compose_up_timeout_sec=0
+            ).options.compose_up_timeout_sec
+            == 0
+        )
 
     def test_long_label_values_are_sanitized(self, temp_dir):
         env = _make_gke_compose_env(temp_dir, suffix=f".{'long_' * 15}")
