@@ -6,7 +6,7 @@
 # dependencies = [
 #   "cryptography<47",
 #   "fastapi",
-#   "google-antigravity>=0.1.20",
+#   "google-antigravity>=0.1.23",
 #   "mcp>=1.27.2,<2",
 # ]
 # ///
@@ -431,7 +431,7 @@ def build_atif_trajectory(
             try:
                 agent_version = version("google-antigravity")
             except Exception:
-                agent_version = "0.1.20"
+                agent_version = "0.1.23"
     for i, step in enumerate(steps):
         step["step_id"] = i + 1
 
@@ -457,6 +457,8 @@ def build_atif_trajectory(
 def main():
     if "--version" in sys.argv:
         installed_version = version("google-antigravity")
+        if "--record-python" in sys.argv:
+            Path(__file__).with_suffix(".python").write_text(sys.executable + "\n")
         print(
             "custom"
             if (os.environ.get(_SDK_WHEEL_PATH_ENV) or "").strip()

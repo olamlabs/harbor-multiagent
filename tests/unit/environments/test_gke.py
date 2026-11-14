@@ -39,6 +39,11 @@ from harbor.models.task.config import EnvironmentConfig, TpuSpec
 from harbor.models.trial.paths import TrialPaths
 
 
+# Read at collection, before the autouse fixture in tests/unit/conftest.py
+# clears the environment for each test.
+_HOST_ENVIRONMENT = dict(os.environ)
+
+
 async def _start_and_capture_pod(gke_env):
     """Run GKEEnvironment.start() with all external calls mocked and
     return the V1Pod that was passed to create_namespaced_pod.
@@ -1449,8 +1454,14 @@ class TestGKEDinDPodSpec:
 
     def test_compose_up_timeout_kwarg(self, temp_dir):
         env = _make_gke_compose_env(temp_dir, compose_up_timeout_sec=900)
-        assert env._kwargs["compose_up_timeout_sec"] == 900
-        assert "compose_up_timeout_sec" not in _make_gke_compose_env(temp_dir)._kwargs
+        assert env.options.compose_up_timeout_sec == 900
+        assert _make_gke_compose_env(temp_dir).options.compose_up_timeout_sec is None
+        assert (
+            _make_gke_compose_env(
+                temp_dir, compose_up_timeout_sec=0
+            ).options.compose_up_timeout_sec
+            == 0
+        )
 
     def test_long_label_values_are_sanitized(self, temp_dir):
         env = _make_gke_compose_env(temp_dir, suffix=f".{'long_' * 15}")
@@ -1896,7 +1907,11 @@ class TestGKEDinDSSH:
         )
 
     @pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
-    async def test_ssh_command_pins_the_pod_host_key(self, temp_dir):
+    async def test_ssh_command_pins_the_pod_host_key(self, temp_dir, monkeypatch):
+        # ssh-keygen runs as a host program, with the host's environment;
+        # Windows' OpenSSH fails without its system variables.
+        for name, value in _HOST_ENVIRONMENT.items():
+            monkeypatch.setenv(name, value)
         env = _make_gke_compose_env(temp_dir)
         dind = env._dind
         authorized_key, host_key = await dind._create_ssh_keys()

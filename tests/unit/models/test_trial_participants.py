@@ -182,5 +182,4 @@ def test_seat_exceptions_count_as_recorded_exceptions():
         ]
     )
 
-    assert result.failure_cause is not None
-    assert result.failure_cause == timeout.policy.cause
+    assert result.recorded_exceptions() == [timeout]

@@ -4,7 +4,6 @@ import asyncio
 import base64
 import json
 import logging
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -14,14 +13,23 @@ import pytest
 pytest.importorskip("sail")
 
 import harbor.environments.sail as sail_mod
-from harbor.environments.base import ExecResult, ServiceOperationsUnsupportedError
+from harbor.environments.base import (
+    ExecResult,
+    HealthcheckError,
+    ServiceOperationsUnsupportedError,
+)
 from harbor.environments.sail import (
     SailEnvironment,
     _SailDinD,
     _SailDirect,
     _referenced_env_names,
 )
-from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
+from harbor.models.task.config import (
+    EnvironmentConfig,
+    HealthcheckConfig,
+    NetworkMode,
+    NetworkPolicy,
+)
 from harbor.models.trial.config import ServiceVolumeConfig
 from harbor.models.trial.paths import TrialPaths
 from harbor.utils.optional_import import MissingExtraError
@@ -180,6 +188,11 @@ def _fail_when(sdk: SimpleNamespace, matches, **fields) -> None:
     sdk.sailbox.run.aio.side_effect = run
 
 
+def _compose_up_failure(**fields) -> Exception:
+    """The error ``sail.Sailbox.compose_up`` raises for a failed start."""
+    return sail_mod.CommandFailedError("compose failed", result=_run_result(**fields))
+
+
 @pytest.fixture
 def sdk(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Mock the SDK's image, app, and Sailbox entry points."""
@@ -190,7 +203,8 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     sailbox.terminate.aio = AsyncMock()
     sailbox.sleep.aio = AsyncMock()
     sailbox.fs.mkdir.aio = AsyncMock()
-    sailbox.fs.write.aio = AsyncMock()
+    sailbox.fs.upload_file.aio = AsyncMock()
+    sailbox.fs.download_file.aio = AsyncMock()
     sailbox.fs.upload_dir.aio = AsyncMock()
     sailbox.fs.download_dir.aio = AsyncMock()
 
@@ -330,7 +344,9 @@ class TestRegistryLogins:
 
         await env.start(force_build=False)
 
-        uploaded = [call.args[0] for call in sdk.sailbox.fs.write.aio.await_args_list]
+        uploaded = [
+            call.args[1] for call in sdk.sailbox.fs.upload_file.aio.await_args_list
+        ]
         assert "/root/.docker/config.json" in uploaded
 
     async def test_a_prebuilt_image_is_pulled_with_its_registry_login(
@@ -351,7 +367,9 @@ class TestRegistryLogins:
 
         await env.start(force_build=False)
 
-        uploaded = [call.args[0] for call in sdk.sailbox.fs.write.aio.await_args_list]
+        uploaded = [
+            call.args[1] for call in sdk.sailbox.fs.upload_file.aio.await_args_list
+        ]
         assert "/root/.docker/config.json" not in uploaded
 
 
@@ -610,64 +628,64 @@ class TestExec:
             await _make_env(temp_dir).exec("true")
 
 
+class TestHealthcheck:
+    CHECK = HealthcheckConfig(command="curl -sf http://localhost:8080/", retries=1)
+
+    async def test_a_passing_check_raises_nothing(self, temp_dir, sdk):
+        env = _make_env(temp_dir)
+        env._sailbox = sdk.sailbox
+
+        await env.run_healthcheck(self.CHECK)
+
+        sdk.sailbox.run.aio.assert_awaited_once()
+
+    async def test_direct_mode_failure_names_the_unrun_entrypoint(self, temp_dir, sdk):
+        env = _make_env(temp_dir)
+        env._sailbox = sdk.sailbox
+        sdk.sailbox.run.aio.return_value = _run_result(7)
+
+        with pytest.raises(HealthcheckError) as info:
+            await env.run_healthcheck(self.CHECK)
+
+        assert str(info.value) == (
+            "Healthcheck failed after 1 consecutive retries: "
+            "curl -sf http://localhost:8080/\n"
+            "A Sailbox runs neither the image's ENTRYPOINT nor its CMD; if the "
+            "check waits for a service they would start, it cannot pass here, so "
+            "start the service from a compose file instead."
+        )
+
+    async def test_compose_mode_failure_is_the_generic_one(self, temp_dir, sdk):
+        env = _make_env(temp_dir, compose=True)
+        env._sailbox = sdk.sailbox
+        sdk.sailbox.run.aio.return_value = _run_result(7)
+
+        with pytest.raises(HealthcheckError) as info:
+            await env.run_healthcheck(self.CHECK)
+
+        assert str(info.value) == (
+            "Healthcheck failed after 1 consecutive retries: "
+            "curl -sf http://localhost:8080/"
+        )
+
+
 class TestFileTransfers:
-    async def test_upload_file_streams_with_source_mode(self, temp_dir, sdk):
+    async def test_files_use_the_sdk_copies(self, temp_dir, sdk):
         env = _make_env(temp_dir)
         env._sailbox = sdk.sailbox
         source = temp_dir / "script.sh"
         source.write_text("#!/bin/sh\n")
-        source.chmod(0o755)
+        target = temp_dir / "out" / "result.txt"
 
         await env.upload_file(source, "/tmp/script.sh")
-
-        (target, handle), kwargs = sdk.sailbox.fs.write.aio.await_args
-        assert target == "/tmp/script.sh"
-        assert handle.closed
-        assert kwargs == {"mode": source.stat().st_mode & 0o777}
-
-    async def test_download_file_streams_to_the_target(self, temp_dir, sdk):
-        env = _make_env(temp_dir)
-        env._sailbox = sdk.sailbox
-        stream = _FileStream(b"pay", b"load")
-        sdk.sailbox.fs.read_stream.return_value = stream
-        target = temp_dir / "out" / "result.txt"
-
         await env.download_file("/tmp/result.txt", target)
 
-        sdk.sailbox.fs.read_stream.assert_called_once_with("/tmp/result.txt")
-        assert target.read_bytes() == b"payload"
-        assert stream.closed
-        assert [path.name for path in target.parent.iterdir()] == ["result.txt"]
-
-    @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason="the full path exceeds the Windows 260-character limit",
-    )
-    async def test_download_file_with_the_longest_name(self, temp_dir, sdk):
-        env = _make_env(temp_dir)
-        env._sailbox = sdk.sailbox
-        sdk.sailbox.fs.read_stream.return_value = _FileStream(b"payload")
-        target = temp_dir / "out" / ("n" * 255)
-
-        await env.download_file("/tmp/result.txt", target)
-
-        assert target.read_bytes() == b"payload"
-
-    async def test_failed_download_keeps_the_existing_target(self, temp_dir, sdk):
-        env = _make_env(temp_dir)
-        env._sailbox = sdk.sailbox
-        stream = _FileStream(b"pay", error=RuntimeError("stream broke"))
-        sdk.sailbox.fs.read_stream.return_value = stream
-        target = temp_dir / "out" / "result.txt"
-        target.parent.mkdir()
-        target.write_bytes(b"previous")
-
-        with pytest.raises(RuntimeError, match="stream broke"):
-            await env.download_file("/tmp/result.txt", target)
-
-        assert target.read_bytes() == b"previous"
-        assert [path.name for path in target.parent.iterdir()] == ["result.txt"]
-        assert stream.closed
+        sdk.sailbox.fs.upload_file.aio.assert_awaited_once_with(
+            source, "/tmp/script.sh"
+        )
+        sdk.sailbox.fs.download_file.aio.assert_awaited_once_with(
+            "/tmp/result.txt", target
+        )
 
     async def test_directories_use_sdk_transfers(self, temp_dir, sdk):
         env = _make_env(temp_dir)
@@ -858,10 +876,10 @@ class TestDinDResourcesOverride:
         env._sailbox = sdk.sailbox
         written: dict[str, dict] = {}
 
-        async def capture(path, data, mode):
-            written[path] = json.load(data)
+        async def capture(source, target):
+            written[target] = json.loads(Path(source).read_bytes())
 
-        sdk.sailbox.fs.write.aio.side_effect = capture
+        sdk.sailbox.fs.upload_file.aio.side_effect = capture
 
         await _dind(env)._stage_resources_compose_file()
 
@@ -894,7 +912,9 @@ class TestDinDStart:
             ["up", "-d"],
             ["exec", "-T", "main", "true"],
         ]
-        uploaded = {call.args[0] for call in sdk.sailbox.fs.write.aio.await_args_list}
+        uploaded = {
+            call.args[1] for call in sdk.sailbox.fs.upload_file.aio.await_args_list
+        }
         assert uploaded == {
             f"/harbor/compose/{sail_mod.COMPOSE_BUILD_PATH.name}",
             f"/harbor/compose/{sail_mod.RESOURCES_COMPOSE_NAME}",
@@ -953,7 +973,7 @@ class TestDinDStart:
             "root",
             "main",
             "bash",
-            "-lc",
+            "-c",
             "mkdir -p /app",
         ]
 
@@ -964,10 +984,10 @@ class TestDinDStart:
         env = _make_env(temp_dir, compose=True, mounts=mounts)
         written: dict[str, bytes] = {}
 
-        async def capture(path, data, mode):
-            written[path] = data.read()
+        async def capture(source, target):
+            written[target] = Path(source).read_bytes()
 
-        sdk.sailbox.fs.write.aio.side_effect = capture
+        sdk.sailbox.fs.upload_file.aio.side_effect = capture
 
         await env.start(force_build=False)
         await env.download_dir("/logs/agent", temp_dir / "agent")
@@ -1009,7 +1029,7 @@ class TestDinDExecRouting:
 
         assert calls == [
             ["exec", "-T", "-w", "/app", "-e", "FOO=bar", "-u", "agent"]
-            + ["main", "bash", "-lc", "id"]
+            + ["main", "bash", "-c", "id"]
         ]
 
     async def test_service_exec_targets_sidecar(self, temp_dir):
@@ -1023,3 +1043,49 @@ class TestDinDExecRouting:
     async def test_service_exec_without_compose_raises(self, temp_dir):
         with pytest.raises(ServiceOperationsUnsupportedError):
             await _make_env(temp_dir).service_exec("echo hi", service="sidecar")
+
+
+class TestDinDTransfers:
+    async def test_upload_copies_through_the_vm_and_removes_the_staging_file(
+        self, temp_dir, sdk
+    ):
+        env = _make_env(temp_dir, compose=True)
+        env._sailbox = sdk.sailbox
+        source = temp_dir / "script.sh"
+        source.write_text("#!/bin/sh\n")
+
+        await env.upload_file(source, "/app/script.sh")
+
+        (_source, staged), _ = sdk.sailbox.fs.upload_file.aio.await_args
+        copy, cleanup = sdk.sailbox.run.aio.await_args_list
+        assert copy.args[0][-3:] == ["cp", staged, "main:/app/script.sh"]
+        assert copy.kwargs["timeout"] == 1800
+        assert cleanup.args[0][-1] == f"rm -f {staged}"
+
+    async def test_failed_cleanup_does_not_fail_the_transfer(
+        self, temp_dir, sdk, caplog
+    ):
+        env = _make_env(temp_dir, compose=True)
+        env._sailbox = sdk.sailbox
+        source = temp_dir / "script.sh"
+        source.write_text("#!/bin/sh\n")
+        sdk.sailbox.run.aio.side_effect = [
+            _run_result(),
+            _run_result(124, timed_out=True),
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            await env.upload_file(source, "/app/script.sh")
+
+        assert "Failed to remove /tmp/harbor_" in caplog.text
+
+    async def test_failed_transfer_keeps_its_error_through_cleanup(self, temp_dir, sdk):
+        env = _make_env(temp_dir, compose=True)
+        env._sailbox = sdk.sailbox
+        sdk.sailbox.run.aio.side_effect = [
+            _run_result(1, stderr="no such file"),
+            _run_result(124, timed_out=True),
+        ]
+
+        with pytest.raises(RuntimeError, match="compose cp failed.*no such file"):
+            await env.download_file("/app/result.txt", temp_dir / "result.txt")
