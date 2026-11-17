@@ -1349,7 +1349,7 @@ def _make_gke_compose_env(
     defaults: dict = {"cpus": 2, "memory_mb": 4096, "storage_mb": 10240}
     defaults.update(env_config_kwargs)
 
-    extra = {}
+    extra = {"dind_image": "harbor-gke-dind-ssh:test"}
     for kwarg in ("dind_image", "compose_up_timeout_sec", "docker_config_path"):
         if kwarg in defaults:
             extra[kwarg] = defaults.pop(kwarg)
@@ -1378,6 +1378,10 @@ class TestGKEComposeModeDetection:
         assert env._compose_mode is True
         assert env._uses_compose is True
         assert env._dind is not None
+
+    def test_compose_requires_an_explicit_ssh_image(self, temp_dir):
+        with pytest.raises(ValueError, match="dind_image.*OpenSSH"):
+            _make_gke_compose_env(temp_dir, dind_image=None)
 
     def test_dockerfile_task_is_not_compose_mode(self, gke_env):
         assert gke_env._compose_mode is False
@@ -1419,7 +1423,7 @@ class TestGKEDinDPodSpec:
         assert len(pod.spec.containers) == 1
         container = pod.spec.containers[0]
         assert container.name == "dind"
-        assert container.image == "docker:28.3.3-dind"
+        assert container.image == "harbor-gke-dind-ssh:test"
         assert container.security_context.privileged is True
         assert pod.spec.restart_policy == "Never"
         assert pod.metadata.labels["mode"] == "dind"
@@ -1899,7 +1903,8 @@ class TestGKEDinDSSH:
         assert container.command[:2] == ["sh", "-c"]
         assert container.args is None
         script = container.command[2]
-        assert "apk add --no-cache openssh-server" in script
+        assert script.startswith("set -e\n")
+        assert "apk" not in script
         assert _SSH_KEYS[0] in script
         assert "host\n-----END OPENSSH PRIVATE KEY-----" in script
         assert script.index("/usr/sbin/sshd -f") < script.index(

@@ -387,7 +387,10 @@ class GKEOptions(EnvironmentOptions):
     cloud_build_disk_size_gb: int = Field(
         default=200, description="Cloud Build disk size in GB (default: 200)"
     )
-    dind_image: str = "docker:28.3.3-dind"
+    dind_image: str | None = Field(
+        default=None,
+        description="DinD image with OpenSSH server preinstalled (required for Compose mode).",
+    )
     docker_config_path: str | None = Field(
         default=None,
         description="A Docker config.json whose registry logins the DinD daemon uses to pull private images.",
@@ -524,6 +527,13 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         )
 
         self._compose_mode = self._compose_mode or bool(self.extra_docker_compose_paths)
+
+        if self._compose_mode and not options.dind_image:
+            raise ValueError(
+                "GKE Compose requires dind_image with OpenSSH server preinstalled; "
+                "build src/harbor/environments/gke-dind-ssh/Dockerfile and pass "
+                "--ek dind_image=<image>."
+            )
 
         self._validate_gke_accelerator_config()
 
@@ -2227,7 +2237,6 @@ class _GKEDinDCompose(DinDComposeOps):
         return "\n".join(
             [
                 "set -e",
-                "apk add --no-cache openssh-server >/dev/null",
                 f"mkdir -p {SSH_DIR}",
                 f"chmod 700 {SSH_DIR}",
                 f"printf %s {shlex.quote(sshd_config())} > {SSH_DIR}/sshd_config",
@@ -2242,7 +2251,7 @@ class _GKEDinDCompose(DinDComposeOps):
 
     def _build_pod(self, authorized_key: str, host_key: str) -> "k8s_client.V1Pod":
         env = self._env
-        dind_image: str = env.options.dind_image
+        dind_image = env.options.dind_image
 
         # The outer pod holds the whole compose stack, so size it to the task's
         # total budget. No daemon-overhead constant is added (matching Daytona /
