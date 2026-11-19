@@ -1,5 +1,5 @@
 [project]
-name = "harbor"
+name = "harbor-multiagent"
 version = "0.26.0"
 description = "A framework for evaluating and optimizing agents and models using sandboxed environments."
 readme = "README.md"
@@ -48,6 +48,7 @@ build-backend = "uv_build"
 required-version = ">=0.13.5"
 
 [tool.uv.build-backend]
+module-name = "harbor"
 source-exclude = [".DS_Store"]
 
 [tool.uv.workspace]
@@ -124,36 +125,35 @@ aca-sandbox = [
     "dockerfile-parse>=2.0.1",
 ]
 cloud = [
-    "harbor[cwsandbox]",
-    "harbor[e2b]",
-    "harbor[daytona]",
-    "harbor[sbx]",
-    "harbor[islo]",
-    "harbor[modal]",
-    "harbor[runloop]",
-    "harbor[langsmith]",
-    "harbor[gke]",
-    "harbor[ec2]",
-    "harbor[tensorlake]",
-    "harbor[novita]",
-    "harbor[use-computer]",
-    "harbor[blaxel]",
-    "harbor[cua]",
-    "harbor[opensandbox]",
-    "harbor[beam]",
-    "harbor[hyperbrowser]",
-    "harbor[hf-sandbox]",
-    "harbor[vercel]",
-    "harbor[runta]",
-    "harbor[prime]",
-    "harbor[sail]",
-    "harbor[kernel]",
-    "harbor[boxd]",
-    "harbor[superserve]",
-    "harbor[aca-sandbox]",
+    "harbor-multiagent[cwsandbox]",
+    "harbor-multiagent[e2b]",
+    "harbor-multiagent[daytona]",
+    "harbor-multiagent[sbx]",
+    "harbor-multiagent[islo]",
+    "harbor-multiagent[modal]",
+    "harbor-multiagent[runloop]",
+    "harbor-multiagent[gke]",
+    "harbor-multiagent[ec2]",
+    "harbor-multiagent[tensorlake]",
+    "harbor-multiagent[novita]",
+    "harbor-multiagent[use-computer]",
+    "harbor-multiagent[blaxel]",
+    "harbor-multiagent[cua]",
+    "harbor-multiagent[opensandbox]",
+    "harbor-multiagent[beam]",
+    "harbor-multiagent[hyperbrowser]",
+    "harbor-multiagent[hf-sandbox]",
+    "harbor-multiagent[vercel]",
+    "harbor-multiagent[runta]",
+    "harbor-multiagent[prime]",
+    "harbor-multiagent[sail]",
+    "harbor-multiagent[kernel]",
+    "harbor-multiagent[boxd]",
+    "harbor-multiagent[superserve]",
+    "harbor-multiagent[aca-sandbox]",
 ]
 
-all = ["harbor[cloud]", "harbor[tinker]", "harbor[computer-1]", "harbor[dspy]", "harbor[adapter]"]
+all = ["harbor-multiagent[cloud]", "harbor-multiagent[tinker]", "harbor-multiagent[computer-1]", "harbor-multiagent[dspy]", "harbor-multiagent[adapter]"]
 tinker = [
     "tinker>=0.38.0",
     "tinker-cookbook>=0.6.1; sys_platform != 'win32' and (sys_platform != 'darwin' or platform_machine == 'arm64')",
@@ -178,12 +178,12 @@ prime = [
 lint = ["ruff>=0.15.17"]
 dev = [
     { include-group = "lint" },
-    "harbor[cloud]",
-    "harbor[huggingface]",
-    "harbor[tinker]",
-    "harbor[computer-1]",
-    "harbor[dspy]",
-    "harbor[adapter]",
+    "harbor-multiagent[cloud]",
+    "harbor-multiagent[huggingface]",
+    "harbor-multiagent[tinker]",
+    "harbor-multiagent[computer-1]",
+    "harbor-multiagent[dspy]",
+    "harbor-multiagent[adapter]",
     "harbor-rewardkit[all]",
     "harbor-langsmith",
     "ipykernel>=6.30.1",

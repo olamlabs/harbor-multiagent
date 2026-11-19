@@ -90,7 +90,7 @@ if TYPE_CHECKING:
     from harbor.verifier.base import BaseVerifier
     from harbor.verifier.verifier import Verifier
 
-__version__ = importlib.metadata.version("harbor")
+__version__ = importlib.metadata.version("harbor-multiagent")
 
 
 # Lazy imports to avoid loading heavy dependencies at package import time
