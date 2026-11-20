@@ -15,7 +15,6 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, cast, override
-from uuid import uuid4
 
 from pydantic import Field
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -45,14 +44,6 @@ from harbor.environments.docker.compose_env import (
 )
 from harbor.environments.docker.docker import _sanitize_docker_image_name
 from harbor.environments.options import EnvironmentOptions
-from harbor.environments.ssh import (
-    SSH_DIR,
-    SSH_PORT,
-    SSHAccessError,
-    run_local,
-    sshd_config,
-    stop_process,
-)
 from harbor.environments.tar_transfer import (
     extract_dir_from_bytes,
     pack_dir_to_bytes,
@@ -388,14 +379,6 @@ class GKEOptions(EnvironmentOptions):
         default=200, description="Cloud Build disk size in GB (default: 200)"
     )
     dind_image: str = "docker:28.3.3-dind"
-    docker_config_path: str | None = Field(
-        default=None,
-        description="A Docker config.json whose registry logins the DinD daemon uses to pull private images.",
-    )
-    compose_up_timeout_sec: int | None = Field(
-        default=None,
-        description="Seconds allowed for `docker compose up` in the DinD pod; 0 for no limit (default: 120).",
-    )
 
 
 class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
@@ -609,17 +592,6 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 "No GCP project specified. Set project_id parameter, "
                 "GCP_PROJECT environment variable, or configure gcloud default project."
             )
-
-    def _exec_api(self) -> k8s_client.CoreV1Api:
-        """A CoreV1Api of its own for one exec or attach.
-
-        ``kubernetes.stream.stream`` temporarily replaces ``ApiClient.request``
-        with the websocket handshake. Execs that run at the same time, or a REST
-        call made while one is starting (pod delete at cleanup), must not share
-        that ApiClient, or the REST call is answered as a failed handshake.
-        """
-        self._api
-        return k8s_client.CoreV1Api(k8s_client.ApiClient())
 
     @property
     def _api(self) -> k8s_client.CoreV1Api:
@@ -1160,7 +1132,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         try:
             resp = await asyncio.to_thread(
                 stream,
-                self._exec_api().connect_get_namespaced_pod_exec,
+                self._api.connect_get_namespaced_pod_exec,
                 self.pod_name,
                 self.namespace,
                 command=exec_command,
@@ -1334,7 +1306,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 test_command = ["true"]
                 resp = await asyncio.to_thread(
                     stream,
-                    self._exec_api().connect_get_namespaced_pod_exec,
+                    self._api.connect_get_namespaced_pod_exec,
                     self.pod_name,
                     self.namespace,
                     command=test_command,
@@ -1388,18 +1360,18 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         source_path = Path(source_path)
 
         tar_buffer = io.BytesIO()
-        with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
+        with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
             tar.add(str(source_path), arcname=Path(target_path).name)
         tar_buffer.seek(0)
 
         target_dir = str(Path(target_path).parent)
         await self.exec(f"mkdir -p {target_dir}", user="root")
 
-        exec_command = ["tar", "xzf", "-", "-C", target_dir]
+        exec_command = ["tar", "xf", "-", "-C", target_dir]
 
         resp = await asyncio.to_thread(
             stream,
-            self._exec_api().connect_get_namespaced_pod_exec,
+            self._api.connect_get_namespaced_pod_exec,
             self.pod_name,
             self.namespace,
             command=exec_command,
@@ -1437,7 +1409,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
         # Pack the whole tree (preserves permissions, symlinks, and empty
         # directories) instead of adding regular files one by one.
-        tar_buffer = pack_dir_to_bytes(source_dir, compress=True)
+        tar_buffer = pack_dir_to_bytes(source_dir)
         tar_size = len(tar_buffer.getvalue())
 
         mkdir_result = await self.exec(f"mkdir -p {target_dir}", user="root")
@@ -1446,12 +1418,12 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 f"Failed to create target directory {target_dir}: {mkdir_result.stderr}"
             )
 
-        exec_command = ["tar", "xzf", "-", "-C", target_dir]
+        exec_command = ["tar", "xf", "-", "-C", target_dir]
 
         try:
             resp = await asyncio.to_thread(
                 stream,
-                self._exec_api().connect_get_namespaced_pod_exec,
+                self._api.connect_get_namespaced_pod_exec,
                 self.pod_name,
                 self.namespace,
                 command=exec_command,
@@ -1500,7 +1472,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
 
         resp = await asyncio.to_thread(
             stream,
-            self._exec_api().connect_get_namespaced_pod_exec,
+            self._api.connect_get_namespaced_pod_exec,
             self.pod_name,
             self.namespace,
             command=exec_command,
@@ -1552,7 +1524,7 @@ class GKEEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         try:
             resp = await asyncio.to_thread(
                 stream,
-                self._exec_api().connect_get_namespaced_pod_exec,
+                self._api.connect_get_namespaced_pod_exec,
                 self.pod_name,
                 self.namespace,
                 command=exec_command,
@@ -1696,19 +1668,9 @@ class _GKEDinDCompose(DinDComposeOps):
 
     The whole compose stack runs inside one privileged pod, so the pod's
     cgroup (sized to the task's total budget) is the real resource ceiling.
-    exec/upload/download target the ``main`` service via a two-hop path: an
-    SSH command into the ``dind`` container, then ``docker compose
-    exec``/``cp`` into ``main``. The Kubernetes API only creates, reads and
-    deletes the pod.
-
-    The ``dind`` container starts ``sshd`` before ``dockerd``, with a host key
-    and an authorized key generated for this trial, and Harbor connects to the
-    pod IP as the EC2 environment connects to its instance. A Kubernetes exec
-    stream would instead pass through the API server and a
-    ``konnectivity-agent`` pod: GKE deletes those pods as the cluster's nodes
-    scale, which closes the streams they carry, and the API server closes an
-    exec websocket on any frame over 32 MiB. Harbor must run where pod IPs are
-    routable, inside the cluster or its VPC.
+    exec/upload/download target the ``main`` service via a two-hop path: a
+    Kubernetes ``exec`` into the ``dind`` container, then ``docker compose
+    exec``/``cp`` into ``main``.
 
     Requires GKE Standard; Autopilot blocks privileged pods.
 
@@ -1725,20 +1687,10 @@ class _GKEDinDCompose(DinDComposeOps):
     _DIND_CONTAINER = "dind"
     _COMPOSE_UP_TIMEOUT_SEC = 120
     _MAIN_CONTAINER_TIMEOUT_SEC = 60
-    # A command in main runs under a non-login bash, as on the docker
-    # provider: a login shell's /etc/profile would replace the image's PATH.
-    _MAIN_LOGIN_SHELL = False
-    _DETACHED_EXEC_DIR = "/harbor/exec"
-    _POLL_WAIT_SEC = 10
-    _STATUS_POLL_FAILURE_LIMIT = 5
-    _SSH_READY_TIMEOUT_SEC = 180
-    _SSH_READY_INTERVAL_SEC = 3
 
     def __init__(self, env: "GKEEnvironment"):
         self._env = env
         self._use_prebuilt = False
-        self._ssh_keys: tempfile.TemporaryDirectory[str] | None = None
-        self._pod_ip: str | None = None
         self._resolved_task_env: dict[str, str] = {}
         if env.task_env_config.env:
             self._resolved_task_env = resolve_env_vars(env.task_env_config.env)
@@ -1767,184 +1719,123 @@ class _GKEDinDCompose(DinDComposeOps):
     async def _fetch_dir_from_host(self, host_dir: str, target_dir: Path | str):
         await self._tar_download_dir(host_dir, Path(target_dir))
 
-    # ── SSH transport into the dind container ────────────────────────────
-
-    async def _create_ssh_keys(self) -> tuple[str, str]:
-        """Generate this trial's client key and the pod's host key.
-
-        Returns the client public key and the host private key, which go into
-        the pod spec. The host public key is pinned once the pod has an IP.
-        """
-        self._ssh_keys = tempfile.TemporaryDirectory(prefix="harbor-gke-ssh-")
-        directory = Path(self._ssh_keys.name)
-        for name in ("identity", "host_key"):
-            await run_local(
-                "ssh-keygen",
-                "-q",
-                "-t",
-                "ed25519",
-                "-N",
-                "",
-                "-C",
-                "",
-                "-f",
-                str(directory / name),
-            )
-        return (
-            (directory / "identity.pub").read_text().strip(),
-            (directory / "host_key").read_text(),
-        )
-
-    def _pin_host_key(self, pod_ip: str) -> None:
-        assert self._ssh_keys is not None
-        directory = Path(self._ssh_keys.name)
-        host_key = " ".join((directory / "host_key.pub").read_text().split()[:2])
-        (directory / "known_hosts").write_text(f"[{pod_ip}]:{SSH_PORT} {host_key}\n")
-        self._pod_ip = pod_ip
-
-    def _ssh_command(self, command: str) -> list[str]:
-        if self._ssh_keys is None or self._pod_ip is None:
-            raise SSHAccessError(f"Pod {self._env.pod_name} has no SSH address yet.")
-        directory = Path(self._ssh_keys.name)
-        args = ["ssh", "-F", os.devnull, "-T", "-p", str(SSH_PORT)]
-        for option in (
-            "BatchMode=yes",
-            "StrictHostKeyChecking=yes",
-            f"UserKnownHostsFile={directory / 'known_hosts'}",
-            f"GlobalKnownHostsFile={os.devnull}",
-            "ConnectTimeout=15",
-            "ServerAliveInterval=15",
-            "ServerAliveCountMax=3",
-            "IdentitiesOnly=yes",
-            "LogLevel=ERROR",
-        ):
-            args.extend(["-o", option])
-        args.extend(["-i", str(directory / "identity"), "-l", "root"])
-        args.extend(["--", self._pod_ip, f"sh -lc {shlex.quote(command)}"])
-        return args
-
-    async def _ssh(
-        self,
-        command: str,
-        *,
-        stdin: bytes | None = None,
-        timeout_sec: float | None = None,
-    ) -> tuple[bytes, bytes, int]:
-        """Run ``sh -lc command`` in the dind container over SSH."""
-        process = await asyncio.create_subprocess_exec(
-            *self._ssh_command(command),
-            stdin=(
-                asyncio.subprocess.PIPE
-                if stdin is not None
-                else asyncio.subprocess.DEVNULL
-            ),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(stdin), timeout_sec
-            )
-        finally:
-            await stop_process(process)
-        return stdout, stderr, process.returncode or 0
-
-    async def _wait_for_ssh(self) -> None:
-        """Wait until sshd in the dind container accepts this trial's key."""
-        env = self._env
-        result: ExecResult | None = None
-        try:
-            async with asyncio.timeout(self._SSH_READY_TIMEOUT_SEC):
-                while True:
-                    try:
-                        await env._check_pod_terminated()
-                    except RuntimeError as e:
-                        raise RuntimeError(
-                            f"{e} Last log lines: {await self._dind_log_tail()}"
-                        ) from e
-                    result = await self._pod_exec("true")
-                    if result.return_code == 0:
-                        return
-                    await asyncio.sleep(self._SSH_READY_INTERVAL_SEC)
-        except TimeoutError:
-            raise SSHAccessError(
-                f"SSH to pod {env.pod_name} at {self._pod_ip}:{SSH_PORT} was not "
-                f"ready after {self._SSH_READY_TIMEOUT_SEC} seconds; Harbor must "
-                f"run where pod IPs are routable. Last error: "
-                f"{result.stderr if result else 'none'}"
-            ) from None
-
-    async def _dind_log_tail(self) -> str:
-        env = self._env
-        try:
-            return await asyncio.to_thread(
-                env._api.read_namespaced_pod_log,
-                name=env.pod_name,
-                namespace=env.namespace,
-                container=self._DIND_CONTAINER,
-                tail_lines=20,
-            )
-        except ApiException as e:
-            return f"(could not read the container log: {e.reason})"
+    # ── Low-level pod exec / tar transfer against the dind container ──────
 
     async def _pod_exec(
-        self, command: str, timeout_sec: float | None = None
+        self, command: str, timeout_sec: int | None = None
     ) -> ExecResult:
-        """Run ``sh -lc command`` in the dind (Alpine) container of the pod."""
+        """Run ``sh -c command`` in the dind (Alpine) container of the pod."""
+        env = self._env
+        await env._ensure_client()
+        exec_command = ["sh", "-c", command]
+        resp = None
         try:
-            stdout, stderr, return_code = await self._ssh(
-                command, timeout_sec=timeout_sec
+            resp = await asyncio.to_thread(
+                stream,
+                env._api.connect_get_namespaced_pod_exec,
+                env.pod_name,
+                env.namespace,
+                container=self._DIND_CONTAINER,
+                command=exec_command,
+                stderr=True,
+                stdin=False,
+                stdout=True,
+                tty=False,
+                _preload_content=False,
             )
-        except TimeoutError:
+            if timeout_sec:
+                stdout, stderr = await asyncio.wait_for(
+                    asyncio.to_thread(env._read_exec_output, resp),
+                    timeout=timeout_sec,
+                )
+            else:
+                stdout, stderr = await asyncio.to_thread(env._read_exec_output, resp)
+            resp.run_forever(timeout=0)
+            return_code = env._exec_return_code(resp)
+            return ExecResult(stdout=stdout, stderr=stderr, return_code=return_code)
+        except asyncio.TimeoutError:
             return ExecResult(
                 stdout=None,
                 stderr=f"Command timed out after {timeout_sec} seconds",
                 return_code=124,
             )
-        return ExecResult(
-            stdout=stdout.decode(errors="replace"),
-            stderr=stderr.decode(errors="replace"),
-            return_code=return_code,
-        )
+        except ApiException as e:
+            if _is_pod_not_found_error(e):
+                raise GKEPodNotFoundError(
+                    f"Pod {env.pod_name} no longer exists in namespace "
+                    f"{env.namespace} (404 Not Found)."
+                ) from e
+            raise
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
 
     async def _tar_upload_file(self, source_path: Path, target_path: str) -> None:
         """Stream a single file into the dind container's filesystem via tar."""
+        env = self._env
+        await env._ensure_client()
+        await env._wait_for_container_exec_ready()
+
+        source_path = Path(source_path)
         tar_buffer = io.BytesIO()
-        with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
+        with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
             tar.add(str(source_path), arcname=Path(target_path).name)
-        await self._tar_extract_to_pod(
-            tar_buffer.getvalue(), str(Path(target_path).parent)
-        )
+        tar_buffer.seek(0)
+
+        target_dir = str(Path(target_path).parent)
+        await self._pod_exec(f"mkdir -p {shlex.quote(target_dir)}")
+        await self._tar_extract_to_pod(tar_buffer, target_dir)
 
     async def _tar_upload_dir(self, source_dir: Path, target_dir: str) -> None:
         """Stream a directory tree into the dind container via tar."""
+        env = self._env
+        await env._ensure_client()
+        await env._wait_for_container_exec_ready()
+
         source_dir = Path(source_dir)
         if not source_dir.is_dir():
-            self._env.logger.warning(f"No files to upload from {source_dir}")
+            env.logger.warning(f"No files to upload from {source_dir}")
             return
 
         # Pack the whole tree (preserves permissions, symlinks, and empty
         # directories) instead of adding regular files one by one.
-        tar_buffer = pack_dir_to_bytes(source_dir, compress=True)
-        await self._tar_extract_to_pod(tar_buffer.getvalue(), target_dir)
+        tar_buffer = pack_dir_to_bytes(source_dir)
 
-    async def _tar_extract_to_pod(self, tar_data: bytes, target_dir: str) -> None:
-        """Pipe a gzipped tar stream into ``tar xzf -`` in the dind container."""
-        quoted = shlex.quote(target_dir)
-        _, stderr, return_code = await self._ssh(
-            f"mkdir -p {quoted} && tar xzf - -C {quoted}", stdin=tar_data
+        await self._pod_exec(f"mkdir -p {shlex.quote(target_dir)}")
+        await self._tar_extract_to_pod(tar_buffer, target_dir)
+
+    async def _tar_extract_to_pod(
+        self, tar_buffer: io.BytesIO, target_dir: str
+    ) -> None:
+        """Pipe a tar stream into ``tar xf -`` in the dind container."""
+        env = self._env
+        resp = await asyncio.to_thread(
+            stream,
+            env._api.connect_get_namespaced_pod_exec,
+            env.pod_name,
+            env.namespace,
+            container=self._DIND_CONTAINER,
+            command=["tar", "xf", "-", "-C", target_dir],
+            stderr=True,
+            stdin=True,
+            stdout=True,
+            tty=False,
+            _preload_content=False,
         )
-        if return_code != 0:
-            raise RuntimeError(
-                f"Upload into {target_dir} in pod {self._env.pod_name} failed "
-                f"with exit code {return_code}: {stderr.decode(errors='replace')}"
-            )
+        resp.write_stdin(tar_buffer.read())
+        resp.run_forever(timeout=1)
+        resp.close()
 
     async def _tar_download_file(self, source_path: str, target_path: Path) -> None:
         """Stream a single file out of the dind container's filesystem."""
+        env = self._env
+        await env._ensure_client()
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        tar_data = await self._tar_read_from_pod(f"tar cf - {shlex.quote(source_path)}")
+        tar_data = await self._tar_read_from_pod(["tar", "cf", "-", source_path])
         tar_buffer = io.BytesIO(tar_data)
         with tarfile.open(fileobj=tar_buffer, mode="r") as tar:
             for member in tar.getmembers():
@@ -1958,10 +1849,11 @@ class _GKEDinDCompose(DinDComposeOps):
     async def _tar_download_dir(self, source_dir: str, target_dir: Path) -> None:
         """Stream a directory tree out of the dind container's filesystem."""
         env = self._env
+        await env._ensure_client()
         target_dir.mkdir(parents=True, exist_ok=True)
 
         tar_data = await self._tar_read_from_pod(
-            f"cd {shlex.quote(source_dir)} && tar cf - ."
+            ["sh", "-c", f"cd {shlex.quote(source_dir)} && tar cf - ."]
         )
         if not tar_data:
             raise RuntimeError(
@@ -1975,15 +1867,32 @@ class _GKEDinDCompose(DinDComposeOps):
                 f"Failed to extract directory {source_dir} from pod {env.pod_name}: {e}"
             )
 
-    async def _tar_read_from_pod(self, command: str) -> bytes:
-        """Run a tar-producing command in the dind container and return its bytes."""
-        stdout, stderr, return_code = await self._ssh(command)
-        if return_code != 0:
-            raise RuntimeError(
-                f"`{command}` in pod {self._env.pod_name} failed with exit code "
-                f"{return_code}: {stderr.decode(errors='replace')}"
-            )
-        return stdout
+    async def _tar_read_from_pod(self, command: list[str]) -> bytes:
+        """Run a tar-producing command in the dind container and read stdout."""
+        env = self._env
+        resp = await asyncio.to_thread(
+            stream,
+            env._api.connect_get_namespaced_pod_exec,
+            env.pod_name,
+            env.namespace,
+            container=self._DIND_CONTAINER,
+            command=command,
+            stderr=True,
+            stdin=False,
+            stdout=True,
+            tty=False,
+            _preload_content=False,
+        )
+        tar_data = b""
+        while resp.is_open():
+            resp.update(timeout=1)
+            if resp.peek_stdout():
+                data = resp.read_stdout()
+                if isinstance(data, str):
+                    data = data.encode("utf-8", errors="surrogateescape")
+                tar_data += data
+        resp.close()
+        return tar_data
 
     # ── docker compose plumbing ──────────────────────────────────────────
 
@@ -2073,92 +1982,7 @@ class _GKEDinDCompose(DinDComposeOps):
         prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env_vars.items())
         command = self._compose_cmd(subcommand)
         full = f"{prefix} {command}" if prefix else command
-        return await self._detached_pod_exec(full, timeout_sec=timeout_sec)
-
-    async def _polled_pod_exec(self, command: str) -> ExecResult:
-        """Run a short read-only command of a detached exec.
-
-        A failed attempt (an SSH connection that dropped or was refused, or a
-        nonzero exit) is followed by a pause of ``_POLL_WAIT_SEC``;
-        ``_STATUS_POLL_FAILURE_LIMIT`` failures in a row fail the command.
-        """
-        result = await self._pod_exec(command)
-        failures = 0
-        while result.return_code != 0:
-            failures += 1
-            if failures >= self._STATUS_POLL_FAILURE_LIMIT:
-                raise RuntimeError(
-                    f"A read of a detached command failed {failures} times in a "
-                    f"row, last with exit code {result.return_code}: "
-                    f"{result.stderr or result.stdout}"
-                )
-            await asyncio.sleep(self._POLL_WAIT_SEC)
-            result = await self._pod_exec(command)
-        return result
-
-    async def _detached_pod_exec(
-        self, command: str, timeout_sec: int | None = None
-    ) -> ExecResult:
-        """Run ``command`` detached in the dind container and poll its status.
-
-        The command writes its output and exit status to files in the dind
-        container, and each poll is a short SSH command of its own, so a
-        dropped connection costs one poll rather than a command that runs for
-        hours (an agent's turn, a large ``compose up``). This is the pattern
-        of the EC2 environment's detached exec. ``timeout_sec`` is one
-        deadline over the whole operation, opening each connection included.
-        """
-        base = f"{self._DETACHED_EXEC_DIR}/{uuid4().hex}"
-        stdout_path, stderr_path, status_path, pid_path = (
-            shlex.quote(f"{base}.{suffix}")
-            for suffix in ("stdout", "stderr", "status", "pid")
-        )
-        wrapper = (
-            f"({command}) > {stdout_path} 2> {stderr_path}; "
-            f"echo $? > {status_path}.tmp && mv {status_path}.tmp {status_path}"
-        )
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout_sec if timeout_sec else None
-        scope = asyncio.timeout_at(deadline)
-        try:
-            async with scope:
-                start = await self._pod_exec(
-                    f"mkdir -p {self._DETACHED_EXEC_DIR} && {{ "
-                    f"setsid sh -c {shlex.quote(wrapper)} < /dev/null > /dev/null 2>&1 & "
-                    f"echo $! > {pid_path}; }}"
-                )
-                if start.return_code != 0:
-                    return start
-
-                while True:
-                    wait_sec = self._POLL_WAIT_SEC
-                    if deadline is not None:
-                        wait_sec = min(wait_sec, max(0, deadline - loop.time()))
-                    poll = await self._polled_pod_exec(
-                        f"i=0; while [ ! -e {status_path} ] && [ $i -lt {int(wait_sec * 5)} ]; "
-                        f"do sleep 0.2; i=$((i+1)); done; cat {status_path} 2>/dev/null || true"
-                    )
-                    status = (poll.stdout or "").strip()
-                    if status:
-                        break
-
-                output = await self._polled_pod_exec(
-                    f"cat {stdout_path} && cat {stderr_path} >&2"
-                )
-                await self._pod_exec(f"rm -f {base}.*")
-        except TimeoutError:
-            if not scope.expired():
-                raise
-            return ExecResult(
-                stdout=None,
-                stderr=f"Command timed out after {timeout_sec} seconds",
-                return_code=124,
-            )
-        return ExecResult(
-            stdout=output.stdout,
-            stderr=output.stderr,
-            return_code=int(status),
-        )
+        return await self._pod_exec(full, timeout_sec=timeout_sec)
 
     async def _stage_resources_compose_file(self) -> None:
         """Write the resources override locally and upload it to the pod.
@@ -2222,25 +2046,7 @@ class _GKEDinDCompose(DinDComposeOps):
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
-    def _startup_script(self, authorized_key: str, host_key: str) -> str:
-        """Start sshd with this trial's keys, then dockerd as the image does."""
-        return "\n".join(
-            [
-                "set -e",
-                "apk add --no-cache openssh-server >/dev/null",
-                f"mkdir -p {SSH_DIR}",
-                f"chmod 700 {SSH_DIR}",
-                f"printf %s {shlex.quote(sshd_config())} > {SSH_DIR}/sshd_config",
-                f"printf %s {shlex.quote(host_key)} > {SSH_DIR}/host_key",
-                f"printf '%s\\n' {shlex.quote(authorized_key)} > {SSH_DIR}/authorized_keys",
-                f"chmod 600 {SSH_DIR}/host_key {SSH_DIR}/authorized_keys",
-                f"/usr/sbin/sshd -t -f {SSH_DIR}/sshd_config",
-                f"/usr/sbin/sshd -f {SSH_DIR}/sshd_config",
-                "exec dockerd-entrypoint.sh dockerd",
-            ]
-        )
-
-    def _build_pod(self, authorized_key: str, host_key: str) -> "k8s_client.V1Pod":
+    def _build_pod(self) -> "k8s_client.V1Pod":
         env = self._env
         dind_image: str = env.options.dind_image
 
@@ -2286,11 +2092,9 @@ class _GKEDinDCompose(DinDComposeOps):
                     k8s_client.V1Container(
                         name=self._DIND_CONTAINER,
                         image=dind_image,
-                        command=[
-                            "sh",
-                            "-c",
-                            self._startup_script(authorized_key, host_key),
-                        ],
+                        # The dind image entrypoint starts dockerd automatically.
+                        command=["dockerd-entrypoint.sh"],
+                        args=["dockerd"],
                         env=[
                             k8s_client.V1EnvVar(name=key, value=value)
                             for key, value in env._startup_env().items()
@@ -2324,16 +2128,9 @@ class _GKEDinDCompose(DinDComposeOps):
         env = self._env
         await env._ensure_client()
 
-        authorized_key, host_key = await self._create_ssh_keys()
-        await env._create_pod(self._build_pod(authorized_key, host_key))
+        await env._create_pod(self._build_pod())
         await env._wait_for_pod_ready()
-        pod = await asyncio.to_thread(
-            env._api.read_namespaced_pod, name=env.pod_name, namespace=env.namespace
-        )
-        if not pod.status.pod_ip:
-            raise RuntimeError(f"Pod {env.pod_name} is running without a pod IP.")
-        self._pin_host_key(pod.status.pod_ip)
-        await self._wait_for_ssh()
+        await env._wait_for_container_exec_ready()
         await self._wait_for_docker_daemon()
 
         # Upload the shared Harbor compose templates + the generated resources
@@ -2356,15 +2153,6 @@ class _GKEDinDCompose(DinDComposeOps):
 
         self._use_prebuilt = not force_build and bool(env.task_env_config.docker_image)
 
-        docker_config_path = env.options.docker_config_path
-        if docker_config_path:
-            # A registry login for private images, as the local docker
-            # environment inherits one from the host's ~/.docker/config.json.
-            await self._host_exec("mkdir -p /root/.docker", timeout_sec=10)
-            await self._stage_file_to_host(
-                docker_config_path, "/root/.docker/config.json"
-            )
-
         env.logger.debug("Building compose services inside DinD pod...")
         result = await self._compose_exec(
             ["build"], timeout_sec=round(env.task_env_config.build_timeout_sec)
@@ -2376,12 +2164,7 @@ class _GKEDinDCompose(DinDComposeOps):
 
         env.logger.debug("Starting compose services inside DinD pod...")
         result = await self._compose_exec(
-            ["up", "-d"],
-            timeout_sec=(
-                self._COMPOSE_UP_TIMEOUT_SEC
-                if env.options.compose_up_timeout_sec is None
-                else env.options.compose_up_timeout_sec
-            ),
+            ["up", "-d"], timeout_sec=self._COMPOSE_UP_TIMEOUT_SEC
         )
         if result.return_code != 0:
             raise RuntimeError(
@@ -2408,13 +2191,7 @@ class _GKEDinDCompose(DinDComposeOps):
             await self._compose_exec(["down", "--remove-orphans"], timeout_sec=30)
         except Exception as e:
             env.logger.warning(f"docker compose down failed: {e}")
-        try:
-            await env._delete_pod_and_release(delete)
-        finally:
-            if self._ssh_keys is not None:
-                self._ssh_keys.cleanup()
-                self._ssh_keys = None
-            self._pod_ip = None
+        await env._delete_pod_and_release(delete)
 
     # ── exec / transfer routed into the main service ─────────────────────
 

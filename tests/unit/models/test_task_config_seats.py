@@ -82,6 +82,7 @@ def test_seats_survive_toml_round_trip():
         ("[agents.maya]\nuser = 'maya'\n", "Extra inputs"),
         ("[agent]\nuser = 'maya'\n[agents.maya]\n", "set user: on each seat"),
         ('[agents."bad name"]\n', "Invalid Docker Compose service name"),
+        ("[agents.main]\n", "main is the task's own service"),
         (
             "[agents.maya]\n[[steps]]\nname = 'one'\n",
             "cannot have steps",

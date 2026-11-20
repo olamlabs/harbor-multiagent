@@ -19,6 +19,7 @@ from harbor.models.trial.config import (
 from harbor.models.trial.result import (
     AgentInfo,
     ExceptionInfo,
+    ModelInfo,
     SeatResult,
     TimingInfo,
     TrialResult,
@@ -116,6 +117,7 @@ def test_trial_lock_tells_rosters_apart():
     swapped = [roster[0].model_copy(update={"model_name": "openai/gpt-6-luna"})]
 
     assert _lock(roster) == _lock([p.model_copy() for p in roster])
+    assert _lock(roster) == _lock(list(reversed(roster)))
     assert _lock(roster) != _lock(swapped + roster[1:])
     assert "participants" not in _lock([]).model_dump_json()
 
@@ -166,6 +168,23 @@ def test_token_and_cost_totals_sum_every_seat():
     result = _result(seat_results=[_seat("maya", True, 0.5), _seat("raj", False, 0.25)])
 
     assert result.compute_token_cost_totals() == (20, None, 4, 0.75)
+
+
+def test_cost_is_unknown_when_a_seat_that_ran_a_model_has_none():
+    priced = _seat("maya", True, 0.5)
+    unpriced = _seat("raj", False, 0.25)
+    unpriced.agent_info = AgentInfo(
+        name="pi", version="1", model_info=ModelInfo(name="m", provider="p")
+    )
+    unpriced.agent_result.cost_usd = None
+    oracle = _seat("lee", False, 0.25)
+    oracle.agent_result.cost_usd = None
+
+    unknown = _result(seat_results=[priced, unpriced])
+    no_model = _result(seat_results=[priced, oracle])
+
+    assert unknown.compute_token_cost_totals() == (20, None, 4, None)
+    assert no_model.compute_token_cost_totals() == (20, None, 4, 0.5)
 
 
 def test_seat_exceptions_count_as_recorded_exceptions():

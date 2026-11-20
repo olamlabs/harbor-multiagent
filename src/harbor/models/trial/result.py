@@ -176,6 +176,8 @@ class TrialResult(BaseModel):
         ``seat_results[i].agent_result``. Aggregate whichever is populated.
         Returned fields preserve the same semantics as ``AgentContext`` —
         in particular ``n_input_tokens`` is total input *including* cache.
+        The cost is None when a seat that ran a model has no cost: the total
+        is unknown, not the other seats' sum.
         """
         if self.agent_result is not None:
             contexts = [self.agent_result]
@@ -204,5 +206,13 @@ class TrialResult(BaseModel):
                 n_output = (n_output or 0) + ctx.n_output_tokens
             if ctx.cost_usd is not None:
                 cost = (cost or 0.0) + ctx.cost_usd
+        if any(
+            seat.agent_result is not None
+            and seat.agent_result.cost_usd is None
+            and seat.agent_info is not None
+            and seat.agent_info.model_info is not None
+            for seat in self.seat_results or []
+        ):
+            cost = None
 
         return n_input, n_cache, n_output, cost

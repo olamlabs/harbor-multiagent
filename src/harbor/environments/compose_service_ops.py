@@ -79,6 +79,8 @@ class ComposeServiceTransport(Protocol):
 
     async def stop_service(self, service: str) -> None: ...
 
+    async def wait_for_services(self, services: list[str]) -> None: ...
+
 
 class ComposeServiceOpsMixin(_Base):
     """Env-level ``service_*`` dispatch shared by DinD compose providers."""
@@ -130,6 +132,11 @@ class ComposeServiceOpsMixin(_Base):
             timeout_sec=timeout_sec,
             user=user,
         )
+
+    @override
+    async def wait_for_services(self, services: list[str]) -> None:
+        transport = self._compose_service_transport(services[0])
+        await transport.wait_for_services(services)
 
     @override
     async def service_upload_file(

@@ -123,7 +123,7 @@ def _run_preflight(config: JobConfig) -> None:
         # Derived jobs check their runnable agents after the trial plan is known.
         if config.source_jobs:
             return
-        for agent in config.agents:
+        for agent in config.participants or config.agents:
             if config.user_agent is not None:
                 AgentFactory.run_preflight(
                     agent,

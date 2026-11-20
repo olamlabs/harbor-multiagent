@@ -1412,6 +1412,20 @@ class DockerEnvironment(BaseEnvironment):
         """Stop one compose service while keeping the rest of the project up."""
         await self._run_docker_compose_command(["stop", service])
 
+    @override
+    async def wait_for_services(self, services: list[str]) -> None:
+        await self._run_docker_compose_command(
+            [
+                "up",
+                "--detach",
+                "--wait",
+                "--no-deps",
+                "--no-recreate",
+                "--no-build",
+                *services,
+            ]
+        )
+
     def _sidecar_platform(self, service: str) -> "UnixOps":
         """Platform ops for sidecar transfers; Linux containers only."""
         from harbor.environments.docker.docker_unix import UnixOps

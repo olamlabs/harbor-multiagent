@@ -307,6 +307,7 @@ class TestRegistryLogins:
                             "username": "hubuser",
                             "password": "hubpass",
                         },
+                        "registry.example.com": {},
                     }
                 }
             )
@@ -361,6 +362,34 @@ class TestRegistryLogins:
             username="octocat",
             password=env._registry_logins[0].password,
         )
+
+    async def test_a_docker_hub_shorthand_image_gets_the_hub_login(self, temp_dir, sdk):
+        env = self._env(temp_dir, docker_image="acme/app:1")
+
+        await env.start(force_build=False)
+
+        sdk.Image.from_registry.assert_called_once_with(
+            "acme/app:1",
+            username="hubuser",
+            password=env._registry_logins[1].password,
+        )
+
+    def test_a_home_relative_config_is_read_and_staged_from_home(
+        self, temp_dir, monkeypatch
+    ):
+        monkeypatch.setenv("HOME", str(temp_dir))
+        monkeypatch.setenv("USERPROFILE", str(temp_dir))
+        self._docker_config(temp_dir)
+
+        env = _make_env(
+            temp_dir, environment_kwargs={"docker_config_path": "~/config.json"}
+        )
+
+        assert env._docker_config_path == str(temp_dir / "config.json")
+        assert [login.prefix for login in env._registry_logins] == [
+            "ghcr.io",
+            "docker.io",
+        ]
 
     async def test_no_config_passes_no_logins(self, temp_dir, sdk):
         env = _make_env(temp_dir, compose=True)
@@ -473,7 +502,7 @@ class TestDirectStart:
             vcpu_count=4,
             memory_limit_gib=40,
             disk_limit_gib=None,
-            max_lifetime_seconds=None,
+            max_lifetime_seconds=86400,
             image_build_timeout=600,
             egress_policy={},
         )
@@ -871,7 +900,7 @@ class TestReferencedEnvNames:
 
 
 class TestDinDResourcesOverride:
-    async def test_auto_policy_reserves_without_capping(self, temp_dir, sdk):
+    async def test_auto_policy_reserves_cpus_but_not_memory(self, temp_dir, sdk):
         env = _make_env(temp_dir, compose=True, cpus=2, memory_mb=4096)
         env._sailbox = sdk.sailbox
         written: dict[str, dict] = {}
@@ -886,12 +915,25 @@ class TestDinDResourcesOverride:
         main = written[f"/harbor/compose/{sail_mod.RESOURCES_COMPOSE_NAME}"][
             "services"
         ]["main"]
-        assert main["deploy"]["resources"]["reservations"] == {
-            "cpus": "2",
-            "memory": "4096M",
-        }
+        assert main["deploy"]["resources"]["reservations"] == {"cpus": "2"}
         assert "cpus" not in main
         assert "mem_limit" not in main
+
+
+class TestDinDReadiness:
+    async def test_a_readiness_timeout_names_the_last_output(self, temp_dir, sdk):
+        env = _make_env(temp_dir, compose=True)
+        env.task_env_config.build_timeout_sec = 1
+        env._sailbox = sdk.sailbox
+        dind = _dind(env)
+        dind._host_exec = AsyncMock(
+            return_value=ExecResult(
+                return_code=1, stdout="", stderr="Cannot connect to the daemon"
+            )
+        )
+
+        with pytest.raises(TimeoutError, match="Cannot connect to the daemon"):
+            await dind._wait_for_docker()
 
 
 class TestDinDStart:

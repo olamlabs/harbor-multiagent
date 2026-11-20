@@ -71,7 +71,7 @@ At least one agent must be under test. In the example, p1 is under test and p2 s
 
 `[agent] timeout_sec` is one agent timeout shared by every agent. Trial and job timeout multipliers apply to it as usual. Without it, the run lasts until every agent under test has ended.
 
-The order of the tables is the agents' order. `agent_info` in `result.json` is the first agent under test, and the trial's error is the first agent error in this order.
+The order of the tables is the agents' order. `agent_info` in `result.json` is the first agent under test, and the trial's error is taken from the agent errors in this order (see [When an agent fails](#when-an-agent-fails)).
 
 ## Instructions
 
@@ -208,23 +208,25 @@ harbor run -c examples/configs/features/seats-job.yaml
 ## How a run works
 
 1. Harbor starts the Compose project and runs the task's healthcheck, as for any task.
-2. Harbor installs every agent into its container at the same time. Each install has its own agent setup timeout. If any install fails, the trial fails before any agent runs.
-3. All agents start together, each with its own instruction.
-4. The run ends when every agent under test has ended, or when the agent timeout runs out.
-5. Harbor cancels the agents still running, as it does for a single agent at its timeout. The containers stay up.
-6. Harbor copies each agent's `/logs/agent` to `seats/<service>/agent/` in the trial folder, and records its trajectory, token usage and cost as it does for a single agent. It does this for every agent, under test or not.
-7. Harbor collects the task's artifacts.
-8. When verification is enabled, Harbor copies the trial's `seats/` folder into `main` at `/logs/seats/`.
-9. The verifier runs once, in `main`, with every container still up.
-10. Harbor stops the project.
+2. Harbor waits for the agents' services with `docker compose up --wait` on those services, so a service with a healthcheck is healthy first. Other services, such as one-shot init services, are not waited on.
+3. Harbor installs every agent into its container at the same time. Each install has its own agent setup timeout. If any install fails, the trial fails before any agent runs.
+4. All agents start together, each with its own instruction.
+5. The run ends when every agent under test has ended, or when the agent timeout runs out.
+6. Harbor cancels the agents still running, as it does for a single agent at its timeout, and kills every process an exec started in their containers, so a stopped agent cannot act during collection and verification. Each container's own processes, under its PID 1, keep running, and the containers stay up.
+7. Harbor copies each agent's `/logs/agent` to `seats/<service>/agent/` in the trial folder, and records its trajectory, token usage and cost as it does for a single agent. It does this for every agent, under test or not.
+8. Harbor collects the task's artifacts.
+9. When verification is enabled, Harbor copies the trial's `seats/` folder into `main` at `/logs/seats/`.
+10. The verifier runs once, in `main`, with every container still up.
+11. Harbor stops the project.
 
 ### When an agent fails
 
-- An agent that exits non-zero, for example on a rejected API key, has ended. Harbor records the error on its seat, the other agents keep going, and the trial is still verified.
-- When the agent timeout runs out, every agent still running records `AgentTimeoutError`, and the trial is still verified.
-- Any other error from an agent's run, such as a bug in the harness code, cancels the other agents and fails the trial without verification, as it would a single-agent trial.
+- An error from an agent's run, whether it exits non-zero, its model client fails, or its harness has a bug, ends that agent. Harbor records the error on its seat, with `override_error_policy` applied, and the other agents keep going.
+- When the agent timeout runs out, every agent under test still running records `AgentTimeoutError`. Supporting agents still running are cancelled without an error.
+- An error a cancelled agent raises while it stops is logged, not recorded.
+- After the run, the trial is verified unless an agent's error has an error policy that skips grading, as for a single-agent trial.
 
-The trial's `exception_info` is the first agent error in `[agents.<service>]` order, supporting agents included. Its message starts with the service name, for example `Seat 'p2': ...`.
+The trial's `exception_info` is the first agent error, in `[agents.<service>]` order and supporting agents included, whose policy skips grading, or else the first agent error. Its message starts with the service name, for example `Seat 'p2': ...`. If the verifier or the trial itself then fails, that error replaces it; every agent's own error stays in `seat_results`.
 
 ## The verifier
 
@@ -254,12 +256,12 @@ The job summary reports each key.
   - `config` has `participants`.
   - `agent_info` is the first agent under test.
   - `agent_setup` and `agent_execution` span all agents.
-  - Token and cost totals sum every agent.
+  - Token totals sum every agent. The cost total sums every agent, and is unknown (`null`) when an agent that ran a model reported no cost. An agent without a model, such as `oracle` or `nop`, costs nothing.
   - `seat_results` lists every agent with `seat`, `under_test`, `agent_info`, `agent_result` (tokens and cost), `agent_setup`, `agent_execution` and `exception_info`.
 
 ## Limitations
 
-- Multi-agent tasks need an environment that can exec in, upload to and download from any Compose service: `docker`, `podman`, and the cloud environments that run Compose (`modal`, `daytona`, `gke`, `ec2` and others). On the rest, Harbor raises `ServiceOperationsUnsupportedError` at the first operation the environment cannot perform in an agent's container.
+- Multi-agent tasks need an environment that can exec in, upload to and download from any Compose service: `docker`, `podman`, and the cloud environments that run Compose (`modal`, `daytona`, `sail`, `gke`, `ec2` and others). On the rest, Harbor raises `ServiceOperationsUnsupportedError` at the first operation the environment cannot perform in an agent's container.
 - On `modal`, use the VM runtime (`environment.kwargs: {modal_vm_runtime: true}`). Modal's default sandbox puts every Compose service on host networking, which fails any task that declares `networks:`.
 - The verifier runs in `main`; separate verifiers are not supported.
 - Network mode must be `public`.

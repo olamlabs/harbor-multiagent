@@ -1,4 +1,5 @@
 import json
+import signal
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -877,9 +878,10 @@ def start(
                     skip_credential_checks=config.install_only,
                 )
             else:
-                AgentFactory.run_preflight(
-                    config.agent, skip_credential_checks=config.install_only
-                )
+                for agent in config.participants or [config.agent]:
+                    AgentFactory.run_preflight(
+                        agent, skip_credential_checks=config.install_only
+                    )
             if config.user_agent is not None:
                 AgentFactory.run_preflight(
                     config.user_agent, skip_credential_checks=config.install_only
@@ -916,6 +918,7 @@ def start(
 
         return await trial.run()
 
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     result = run_async(_create_and_run())
 
     console.print("\n[bold green]Trial completed![/bold green]")

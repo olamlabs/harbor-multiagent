@@ -1573,6 +1573,13 @@ class BaseEnvironment(ABC):
             self._service_unsupported_message(service)  # ty: ignore[invalid-argument-type]
         )
 
+    async def wait_for_services(self, services: list[str]) -> None:
+        """Wait until each compose service is running, and healthy if it has a
+        healthcheck, as ``docker compose up --wait`` judges them."""
+        raise ServiceOperationsUnsupportedError(
+            self._service_unsupported_message(services[0])
+        )
+
     async def service_upload_file(
         self,
         source_path: Path | str,

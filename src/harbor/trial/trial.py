@@ -190,7 +190,7 @@ class Trial(ABC):
         self._effective_skills_dir = self._resolve_effective_skills_dir()
 
         self._hooks: dict[TrialEvent, list[TrialHookCallback]] = {
-            event: [] for event in TrialEvent
+            event: [self._journal_event] for event in TrialEvent
         }
 
         self._are_agent_logs_downloaded = False
@@ -523,6 +523,7 @@ class Trial(ABC):
                 config,
                 _task=task,
                 _task_download_result=task_download_result,
+                _trial_id=trial_id,
             )
         elif task.has_steps:
             from harbor.trial.multi_step import MultiStepTrial
@@ -570,6 +571,11 @@ class Trial(ABC):
             ),
             download_result,
         )
+
+    async def _journal_event(self, hook_event: TrialHookEvent) -> None:
+        with (self.paths.trial_dir / "trial-events.jsonl").open("a") as events:
+            events.write(hook_event.model_dump_json(include={"event", "timestamp"}))
+            events.write("\n")
 
     def add_hook(self, event: TrialEvent, hook: TrialHookCallback) -> None:
         self._hooks[event].append(hook)
@@ -1289,7 +1295,7 @@ class Trial(ABC):
         secrets: set[str] = set()
         # An agent may resolve its model key from the host environment or a
         # native config, neither of which appears in its extra_env.
-        for agent in (self.agent, self.user_agent):
+        for agent in (primary_agent, self.user_agent):
             if not isinstance(agent, BaseInstalledAgent):
                 continue
             try:

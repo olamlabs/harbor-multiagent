@@ -30,7 +30,9 @@ class RecordingDinD(DinDComposeOps):
         self.calls.append(("stage", host_dir))
 
     def copy(self) -> list[str]:
-        return next(args for kind, args in self.calls if kind == "compose")
+        return next(
+            args for kind, args in self.calls if kind == "compose" and args[0] == "cp"
+        )
 
     def staged(self) -> str:
         return next(str(path) for kind, path in self.calls if kind == "stage")
@@ -50,6 +52,32 @@ async def test_service_upload_dir_copies_contents_into_the_service():
     await dind.service_upload_dir("/local/tools", "/opt/tools", service="p1")
 
     assert dind.copy() == ["cp", f"{dind.staged()}/.", "p1:/opt/tools"]
+    mkdir = ["exec", "-T", "-u", "root", "p1", "mkdir", "-p", "/opt/tools"]
+    assert dind.calls.index(("compose", mkdir)) < dind.calls.index(
+        ("compose", dind.copy())
+    )
+
+
+async def test_waiting_for_services_uses_compose_health():
+    dind = RecordingDinD()
+
+    await dind.wait_for_services(["p1", "p2"])
+
+    assert dind.calls == [
+        (
+            "compose",
+            [
+                "up",
+                "--detach",
+                "--wait",
+                "--no-deps",
+                "--no-recreate",
+                "--no-build",
+                "p1",
+                "p2",
+            ],
+        )
+    ]
 
 
 async def test_upload_without_a_service_still_targets_main():

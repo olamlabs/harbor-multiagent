@@ -174,6 +174,14 @@ class DinDComposeOps:
         """Two-hop upload: stage to host temp dir, ``docker compose cp`` into a
         compose container (default: main)."""
         service = service or MAIN_SERVICE_NAME
+        made = await self._compose_exec(
+            ["exec", "-T", "-u", "root", service, "mkdir", "-p", target_dir]
+        )
+        if made.return_code != 0:
+            raise RuntimeError(
+                f"Failed to create {target_dir} in {service}: "
+                f"{made.stdout} {made.stderr}"
+            )
         temp = f"/tmp/harbor_{uuid4().hex}"
         try:
             await self._stage_dir_to_host(source_dir, temp)
@@ -321,6 +329,24 @@ class DinDComposeOps:
         service: str | None = None,
     ) -> None:
         await self.upload_file(source_path, target_path, service=service)
+
+    async def wait_for_services(self, services: list[str]) -> None:
+        result = await self._compose_exec(
+            [
+                "up",
+                "--detach",
+                "--wait",
+                "--no-deps",
+                "--no-recreate",
+                "--no-build",
+                *services,
+            ]
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                f"Services {services} are not running and healthy: "
+                f"{result.stdout} {result.stderr}"
+            )
 
     async def service_upload_dir(
         self,

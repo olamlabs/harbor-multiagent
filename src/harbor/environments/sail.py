@@ -22,7 +22,7 @@ import re
 import shlex
 import tempfile
 from abc import abstractmethod
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any, cast, override
 
@@ -124,9 +124,11 @@ def _bash_argv(command: str, cwd: str | None = None) -> list[str]:
 def _registry_logins(docker_config_path: str | Path | None) -> list[RegistryLogin]:
     """The logins in a Docker ``config.json``, for Sail's image builds.
 
-    Each ``auths`` entry becomes a login for its registry host, with the
-    password sent only with the request that uses it. Docker Hub's entry is
-    keyed by its index URL, which is the registry ``docker.io``.
+    Each ``auths`` entry that carries a credential becomes a login for its
+    registry host, with the password sent only with the request that uses it;
+    an entry without one, as Docker writes when a credential helper holds the
+    secret, is skipped. Docker Hub's entry is keyed by its index URL, which is
+    the registry ``docker.io``.
     """
     if not docker_config_path:
         return []
@@ -137,8 +139,10 @@ def _registry_logins(docker_config_path: str | Path | None) -> list[RegistryLogi
             username, _, password = (
                 base64.b64decode(entry["auth"]).decode().partition(":")
             )
-        else:
+        elif entry.get("username") or entry.get("password"):
             username, password = entry.get("username", ""), entry.get("password", "")
+        else:
+            continue
         host = registry.split("://", 1)[-1].split("/", 1)[0]
         logins.append(
             RegistryLogin(
@@ -148,6 +152,15 @@ def _registry_logins(docker_config_path: str | Path | None) -> list[RegistryLogi
             )
         )
     return logins
+
+
+def _qualified_reference(image: str) -> str:
+    """The image reference with its registry host, as Docker resolves it: a
+    reference whose first component is not a host is on Docker Hub."""
+    first, _, rest = image.partition("/")
+    if rest and ("." in first or ":" in first or first == "localhost"):
+        return image
+    return f"docker.io/{image}" if rest else f"docker.io/library/{image}"
 
 
 def _referenced_env_names(text: str) -> set[str]:
@@ -211,11 +224,12 @@ class _SailDirect(_SailStrategy):
         if docker_image and should_use_prebuilt_docker_image(
             env.environment_dir, docker_image=docker_image, force_build=force_build
         ):
+            reference = _qualified_reference(docker_image)
             login = max(
                 (
                     login
                     for login in env._registry_logins
-                    if docker_image.startswith(f"{login.prefix}/")
+                    if reference.startswith(f"{login.prefix}/")
                 ),
                 key=lambda login: len(login.prefix),
                 default=None,
@@ -449,9 +463,6 @@ class _SailDinD(DinDComposeOps, _SailStrategy):
                 cpu_limit=self._env._resource_limit_value(
                     "cpu", auto_mode=ResourceMode.REQUEST
                 ),
-                memory_request_mb=self._env._resource_request_value(
-                    "memory", auto_mode=ResourceMode.REQUEST
-                ),
                 memory_limit_mb=self._env._resource_limit_value(
                     "memory", auto_mode=ResourceMode.REQUEST
                 ),
@@ -506,19 +517,39 @@ class _SailDinD(DinDComposeOps, _SailStrategy):
                 f"Failed to create the working directory {workdir}: {result.stderr}"
             )
 
+    async def _wait_until(
+        self, what: str, check: Callable[[], Awaitable[ExecResult]]
+    ) -> None:
+        """Run ``check`` every second until it succeeds; on timeout, raise
+        with the last attempt's output."""
+        timeout_sec = self._env._build_timeout_sec
+        result: ExecResult | None = None
+        try:
+            async with asyncio.timeout(timeout_sec):
+                while (result := await check()).return_code != 0:
+                    await asyncio.sleep(1)
+        except TimeoutError:
+            last = (
+                f"{result.stdout or ''}{result.stderr or ''}".strip()
+                if result
+                else "no attempt finished"
+            )
+            raise TimeoutError(
+                f"{what} not ready after {timeout_sec} seconds: {last}"
+            ) from None
+
     async def _wait_for_docker(self) -> None:
         """Wait for the VM's Docker daemon, which starts at boot, to answer."""
-        async with asyncio.timeout(self._env._build_timeout_sec):
-            while (await self._host_exec("docker info")).return_code != 0:
-                await asyncio.sleep(1)
+        await self._wait_until(
+            "The Sailbox's Docker daemon", lambda: self._host_exec("docker info")
+        )
 
     async def _wait_for_main_container(self) -> None:
         """Wait for the main service to take commands."""
-        async with asyncio.timeout(self._env._build_timeout_sec):
-            while (
-                await self._compose_exec(["exec", "-T", MAIN_SERVICE_NAME, "true"])
-            ).return_code != 0:
-                await asyncio.sleep(1)
+        await self._wait_until(
+            "The main service",
+            lambda: self._compose_exec(["exec", "-T", MAIN_SERVICE_NAME, "true"]),
+        )
 
     async def _stage_docker_login(self) -> None:
         """Give the VM's Docker the logins in ``docker_config_path``, as the
@@ -607,8 +638,8 @@ class SailOptions(EnvironmentOptions):
         default="harbor",
         description="Name of the Sail app that owns the Sailboxes.",
     )
-    max_lifetime_seconds: int | None = Field(
-        default=None,
+    max_lifetime_seconds: int = Field(
+        default=86400,
         description="Seconds after creation at which Sail terminates the Sailbox, even if Harbor never stops it.",
     )
     docker_config_path: str | None = Field(
@@ -718,7 +749,8 @@ class SailEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
                 created with the same app name share one app, which is created
                 on first use. Default is "harbor".
             max_lifetime_seconds: Seconds after creation at which Sail terminates
-                the Sailbox, even if Harbor never stops it. Default is no limit.
+                the Sailbox, even if Harbor never stops it. Default is 86400
+                (one day).
             docker_config_path: A Docker ``config.json`` whose registry logins
                 pull private images, as the local docker environment uses the
                 host's login: Sail's image build gets them for a
@@ -732,7 +764,11 @@ class SailEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         options = self.options
         app_name = options.app_name
         max_lifetime_seconds = options.max_lifetime_seconds
-        docker_config_path = options.docker_config_path
+        docker_config_path = (
+            str(Path(options.docker_config_path).expanduser())
+            if options.docker_config_path
+            else None
+        )
         if not _HAS_SAIL:
             raise MissingExtraError(package="sail", extra="sail")
 

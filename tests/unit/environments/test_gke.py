@@ -6,16 +6,8 @@ requests/limits, node selectors, tolerations) when
 task_env_config.gpus > 0 or task_env_config.tpu is not None.
 """
 
-import asyncio
-import gzip
 import json
-import os
 import re
-import shutil
-import sys
-import tempfile
-import time
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -25,7 +17,6 @@ from kubernetes.stream.ws_client import ERROR_CHANNEL, WSClient
 from pydantic import ValidationError
 
 from harbor.environments import gke as gke_module
-from harbor.environments.ssh import SSHAccessError
 from harbor.environments.gke import (
     GKE_GPU_TYPE_MAP,
     GKE_TPU_TYPE_MAP,
@@ -37,11 +28,6 @@ from harbor.environments.gke import (
 )
 from harbor.models.task.config import EnvironmentConfig, TpuSpec
 from harbor.models.trial.paths import TrialPaths
-
-
-# Read at collection, before the autouse fixture in tests/unit/conftest.py
-# clears the environment for each test.
-_HOST_ENVIRONMENT = dict(os.environ)
 
 
 async def _start_and_capture_pod(gke_env):
@@ -387,6 +373,30 @@ class TestGKEExecStream:
         assert result.return_code == 1
         assert "API error (403)" in (result.stderr or "")
 
+    async def test_compose_exec_raises_fatal_error_on_handshake_404(
+        self, gke_env, monkeypatch
+    ):
+        """Compose-mode GKEEnvironment.exec() also raises GKEPodNotFoundError."""
+        monkeypatch.setattr(
+            gke_module,
+            "stream",
+            MagicMock(
+                side_effect=ApiException(
+                    status=0, reason="Handshake status 404 Not Found"
+                )
+            ),
+        )
+        gke_env._ensure_client = AsyncMock()
+        gke_env._core_api = MagicMock(spec=k8s_client.CoreV1Api)
+        gke_env._compose_mode = True
+        gke_env._dind = gke_module._GKEDinDCompose(gke_env)
+
+        with pytest.raises(GKEPodNotFoundError) as exc_info:
+            await gke_env.exec("true")
+
+        assert gke_env.pod_name in str(exc_info.value)
+        assert gke_env.namespace in str(exc_info.value)
+
     def test_is_pod_not_found_error_classifications(self):
         assert _is_pod_not_found_error(ApiException(status=404, reason="Not Found"))
         assert _is_pod_not_found_error(
@@ -408,164 +418,57 @@ class TestGKEExecStream:
         assert not _is_pod_not_found_error(ApiException(status=403, reason="Forbidden"))
         assert not _is_pod_not_found_error(RuntimeError("pod not found"))
 
-    async def test_compose_exec_runs_detached_and_reads_status_files(self, gke_env):
-        from harbor.environments.base import ExecResult
-
+    @pytest.mark.parametrize("return_code", [0, 17])
+    async def test_dind_exec_preserves_kubernetes_command_status(
+        self, gke_env, monkeypatch, return_code
+    ):
+        response = MagicMock(returncode=return_code)
+        monkeypatch.setattr(gke_module, "stream", MagicMock(return_value=response))
+        gke_env._ensure_client = AsyncMock()
+        gke_env._core_api = MagicMock(spec=k8s_client.CoreV1Api)
+        gke_env._read_exec_output = MagicMock(return_value=("stdout", "stderr"))
         dind = gke_module._GKEDinDCompose(gke_env)
-        dind._pod_exec = AsyncMock(
-            side_effect=[
-                ExecResult(return_code=0),
-                ExecResult(stdout="17\n", return_code=0),
-                ExecResult(stdout="out", stderr="err", return_code=0),
-                ExecResult(return_code=0),
-            ]
-        )
 
-        result = await dind._compose_exec(["exec", "-T", "main", "true"])
+        result = await dind._pod_exec(f"exit {return_code}")
 
-        assert (result.return_code, result.stdout, result.stderr) == (17, "out", "err")
-        start, poll, read, cleanup = (c.args[0] for c in dind._pod_exec.await_args_list)
-        assert "setsid sh -c" in start
-        assert "docker compose" in start
-        assert ".status" in poll
-        assert "&& cat" in read and "rm -f" not in read
-        assert "rm -f" in cleanup
+        assert result.return_code == return_code
+        assert result.stdout == "stdout"
+        assert result.stderr == "stderr"
+        response.close.assert_called_once_with()
 
-    async def test_compose_exec_survives_a_dropped_poll_connection(self, gke_env):
-        from harbor.environments.base import ExecResult
-
+    async def test_dind_exec_rejects_stream_without_command_status(
+        self, gke_env, monkeypatch
+    ):
+        response = MagicMock(returncode=None)
+        monkeypatch.setattr(gke_module, "stream", MagicMock(return_value=response))
+        gke_env._ensure_client = AsyncMock()
+        gke_env._core_api = MagicMock(spec=k8s_client.CoreV1Api)
+        gke_env._read_exec_output = MagicMock(return_value=("partial", ""))
         dind = gke_module._GKEDinDCompose(gke_env)
-        dind._POLL_WAIT_SEC = 0
-        dind._pod_exec = AsyncMock(
-            side_effect=[
-                ExecResult(return_code=0),
-                ExecResult(stderr="Connection reset by peer", return_code=255),
-                ExecResult(stdout="0\n", return_code=0),
-                ExecResult(stdout="done", stderr="", return_code=0),
-                ExecResult(return_code=0),
-            ]
-        )
-
-        result = await dind._compose_exec(["exec", "-T", "main", "true"])
-
-        assert result.return_code == 0
-        assert result.stdout == "done"
-
-    async def test_compose_exec_raises_after_consecutive_failed_polls(self, gke_env):
-        from harbor.environments.base import ExecResult
-
-        dind = gke_module._GKEDinDCompose(gke_env)
-        dind._STATUS_POLL_FAILURE_LIMIT = 2
-        dind._POLL_WAIT_SEC = 0
-        refused = ExecResult(stderr="Connection refused", return_code=255)
-        dind._pod_exec = AsyncMock(
-            side_effect=[ExecResult(return_code=0), refused, refused]
-        )
 
         with pytest.raises(
-            RuntimeError, match="2 times in a row, last with exit code 255"
+            GKEExecStreamClosedError, match="before command completion status"
         ):
-            await dind._compose_exec(["exec", "-T", "main", "true"])
+            await dind._pod_exec("sleep 600")
 
-    async def test_compose_exec_pauses_after_a_failed_poll(self, gke_env):
-        from harbor.environments.base import ExecResult
+        response.close.assert_called_once_with()
 
+    @pytest.mark.parametrize("method", ["upload_file", "upload_dir"])
+    async def test_dind_uploads_reach_the_named_service(self, gke_env, method):
         dind = gke_module._GKEDinDCompose(gke_env)
-        dind._POLL_WAIT_SEC = 0.2
-        refused = ExecResult(stderr="Connection refused", return_code=255)
-        dind._pod_exec = AsyncMock(
-            side_effect=[
-                ExecResult(return_code=0),
-                refused,
-                refused,
-                ExecResult(stdout="0\n", return_code=0),
-                ExecResult(stdout="done", return_code=0),
-                ExecResult(return_code=0),
-            ]
-        )
+        dind._compose_exec = AsyncMock(return_value=_exec_result(0))
+        dind._stage_file_to_host = AsyncMock()
+        dind._stage_dir_to_host = AsyncMock()
+        dind._remove_host_path = AsyncMock()
 
-        started = time.monotonic()
-        result = await dind._compose_exec(["exec", "-T", "main", "true"])
+        await getattr(dind, method)("/local/x", "/opt/x", service="p1")
 
-        assert result.return_code == 0
-        assert time.monotonic() - started >= 0.4
-
-    async def test_compose_exec_fails_when_its_output_cannot_be_read(self, gke_env):
-        from harbor.environments.base import ExecResult
-
-        dind = gke_module._GKEDinDCompose(gke_env)
-        dind._STATUS_POLL_FAILURE_LIMIT = 2
-        dind._POLL_WAIT_SEC = 0
-        dropped = ExecResult(stderr="Connection reset by peer", return_code=255)
-        dind._pod_exec = AsyncMock(
-            side_effect=[
-                ExecResult(return_code=0),
-                ExecResult(stdout="0\n", return_code=0),
-                dropped,
-                dropped,
-            ]
-        )
-
-        with pytest.raises(RuntimeError, match="Connection reset by peer"):
-            await dind._compose_exec(["exec", "-T", "main", "true"])
-
-    async def test_compose_exec_times_out_while_polling(self, gke_env):
-        from harbor.environments.base import ExecResult
-
-        dind = gke_module._GKEDinDCompose(gke_env)
-
-        async def _fake_pod_exec(command, timeout_sec=None):
-            if "while" in command:
-                await asyncio.sleep(0.2)
-            return ExecResult(stdout="", return_code=0)
-
-        dind._pod_exec = _fake_pod_exec
-
-        result = await dind._compose_exec(["up", "-d"], timeout_sec=1)
-
-        assert result.return_code == 124
-        assert result.stderr == "Command timed out after 1 seconds"
-
-    @pytest.mark.parametrize("blocked_step", ["setsid", "while", "&& cat", "rm -f"])
-    async def test_compose_exec_deadline_covers_every_step(self, gke_env, blocked_step):
-        async def _fake_ssh(command, *, stdin=None, timeout_sec=None):
-            if blocked_step in command:
-                await asyncio.sleep(3)
-            return (b"0\n" if "while" in command else b"", b"", 0)
-
-        dind = gke_module._GKEDinDCompose(gke_env)
-        dind._ssh = _fake_ssh
-
-        started = time.monotonic()
-        result = await dind._compose_exec(["build"], timeout_sec=1)
-
-        assert time.monotonic() - started < 2
-        assert result.return_code == 124
-        assert result.stderr == "Command timed out after 1 seconds"
-
-    async def test_compose_exec_fails_on_consecutive_nonzero_polls(self, gke_env):
-        from harbor.environments.base import ExecResult
-
-        dind = gke_module._GKEDinDCompose(gke_env)
-        dind._POLL_WAIT_SEC = 0
-        killed = ExecResult(stderr="poll killed", return_code=137)
-        dind._pod_exec = AsyncMock(
-            side_effect=[
-                ExecResult(return_code=0),
-                *[killed] * 6,
-                ExecResult(stdout="0\n", return_code=0),
-                ExecResult(stdout="done", return_code=0),
-            ]
-        )
-
-        with pytest.raises(RuntimeError, match="exit code 137: poll killed"):
-            await dind._compose_exec(["exec", "-T", "main", "true"])
-
-    async def test_pod_exec_before_start_has_no_address(self, gke_env):
-        dind = gke_module._GKEDinDCompose(gke_env)
-
-        with pytest.raises(SSHAccessError, match="no SSH address"):
-            await dind._pod_exec("true")
+        copies = [
+            call.args[0]
+            for call in dind._compose_exec.await_args_list
+            if call.args[0][0] == "cp"
+        ]
+        assert copies[0][-1] == "p1:/opt/x"
 
 
 @pytest.fixture
@@ -1325,12 +1228,6 @@ class TestGKEAcceleratorMutualExclusion:
 # ── Docker-in-Docker compose mode ──────────────────────────────────────
 
 
-_SSH_KEYS = (
-    "ssh-ed25519 AAAAC3client",
-    "-----BEGIN OPENSSH PRIVATE KEY-----\nhost\n-----END OPENSSH PRIVATE KEY-----\n",
-)
-
-
 def _make_gke_compose_env(
     temp_dir, *, suffix="", compose_content=None, **env_config_kwargs
 ):
@@ -1350,9 +1247,8 @@ def _make_gke_compose_env(
     defaults.update(env_config_kwargs)
 
     extra = {}
-    for kwarg in ("dind_image", "compose_up_timeout_sec", "docker_config_path"):
-        if kwarg in defaults:
-            extra[kwarg] = defaults.pop(kwarg)
+    if "dind_image" in defaults:
+        extra["dind_image"] = defaults.pop("dind_image")
 
     return GKEEnvironment(
         environment_dir=env_dir,
@@ -1408,13 +1304,13 @@ class TestGKEDinDPodSpec:
 
     def test_service_account_token_not_mounted(self, temp_dir):
         env = _make_gke_compose_env(temp_dir)
-        pod = env._dind._build_pod(*_SSH_KEYS)
+        pod = env._dind._build_pod()
 
         assert pod.spec.automount_service_account_token is False
 
     def test_pod_is_privileged_single_dind_container(self, temp_dir):
         env = _make_gke_compose_env(temp_dir)
-        pod = env._dind._build_pod(*_SSH_KEYS)
+        pod = env._dind._build_pod()
 
         assert len(pod.spec.containers) == 1
         container = pod.spec.containers[0]
@@ -1426,7 +1322,7 @@ class TestGKEDinDPodSpec:
 
     def test_pod_mounts_docker_storage(self, temp_dir):
         env = _make_gke_compose_env(temp_dir)
-        pod = env._dind._build_pod(*_SSH_KEYS)
+        pod = env._dind._build_pod()
 
         container = pod.spec.containers[0]
         mounts = {m.name: m.mount_path for m in container.volume_mounts}
@@ -1438,7 +1334,7 @@ class TestGKEDinDPodSpec:
 
     def test_outer_pod_sized_to_task_budget(self, temp_dir):
         env = _make_gke_compose_env(temp_dir, cpus=2, memory_mb=4096)
-        pod = env._dind._build_pod(*_SSH_KEYS)
+        pod = env._dind._build_pod()
 
         requests = pod.spec.containers[0].resources.requests
         assert requests["cpu"] == "2"
@@ -1449,23 +1345,12 @@ class TestGKEDinDPodSpec:
 
     def test_custom_dind_image(self, temp_dir):
         env = _make_gke_compose_env(temp_dir, dind_image="docker:27-dind")
-        pod = env._dind._build_pod(*_SSH_KEYS)
+        pod = env._dind._build_pod()
         assert pod.spec.containers[0].image == "docker:27-dind"
-
-    def test_compose_up_timeout_kwarg(self, temp_dir):
-        env = _make_gke_compose_env(temp_dir, compose_up_timeout_sec=900)
-        assert env.options.compose_up_timeout_sec == 900
-        assert _make_gke_compose_env(temp_dir).options.compose_up_timeout_sec is None
-        assert (
-            _make_gke_compose_env(
-                temp_dir, compose_up_timeout_sec=0
-            ).options.compose_up_timeout_sec
-            == 0
-        )
 
     def test_long_label_values_are_sanitized(self, temp_dir):
         env = _make_gke_compose_env(temp_dir, suffix=f".{'long_' * 15}")
-        pod = env._dind._build_pod(*_SSH_KEYS)
+        pod = env._dind._build_pod()
 
         assert pod.metadata.labels["session"] == env.pod_name
         assert len(pod.metadata.labels["session"]) <= 63
@@ -1519,7 +1404,7 @@ class TestGKEComposeFileFlags:
 
     def test_dind_pod_injects_environment(self, temp_dir):
         env = _make_gke_compose_env(temp_dir, env={"TASK_KEY": "task-value"})
-        pod = env._dind._build_pod(*_SSH_KEYS)
+        pod = env._dind._build_pod()
 
         assert {item.name: item.value for item in pod.spec.containers[0].env} == {
             "TASK_KEY": "task-value"
@@ -1590,7 +1475,7 @@ class TestGKEServiceOperationsCompose:
 
         (command,) = calls
         assert command[:4] == ["exec", "-T", "-w", "/main/workdir"]
-        assert command[-4:] == ["main", "bash", "-c", "echo hi"]
+        assert command[-4:] == ["main", "bash", "-lc", "echo hi"]
 
     async def test_service_exec_sidecar_passes_explicit_options(self, temp_dir):
         env = _make_gke_compose_env(temp_dir)
@@ -1867,154 +1752,3 @@ class TestGKEImageTag:
 
         assert await gke_env._image_exists() is True
         assert gke_env._get_image_url() in recorded[0]
-
-
-class TestGKEExecApi:
-    def test_each_exec_gets_its_own_api_client(self, gke_env):
-        """stream() patches ApiClient.request during the handshake, so execs that
-        overlap, and REST calls made meanwhile, must not share the ApiClient."""
-        gke_env._core_api = k8s_client.CoreV1Api(k8s_client.ApiClient())
-
-        first = gke_env._exec_api()
-        second = gke_env._exec_api()
-
-        assert isinstance(first, k8s_client.CoreV1Api)
-        assert first.api_client is not second.api_client
-        assert first.api_client is not gke_env._api.api_client
-
-    def test_exec_api_needs_an_initialized_environment(self, gke_env):
-        gke_env._core_api = None
-
-        with pytest.raises(RuntimeError):
-            gke_env._exec_api()
-
-
-class TestGKEDinDSSH:
-    """The DinD pod is reached over SSH with keys made for the trial."""
-
-    def test_pod_starts_sshd_with_trial_keys_before_dockerd(self, temp_dir):
-        env = _make_gke_compose_env(temp_dir)
-        container = env._dind._build_pod(*_SSH_KEYS).spec.containers[0]
-
-        assert container.command[:2] == ["sh", "-c"]
-        assert container.args is None
-        script = container.command[2]
-        assert "apk add --no-cache openssh-server" in script
-        assert _SSH_KEYS[0] in script
-        assert "host\n-----END OPENSSH PRIVATE KEY-----" in script
-        assert script.index("/usr/sbin/sshd -f") < script.index(
-            "exec dockerd-entrypoint.sh dockerd"
-        )
-
-    @pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
-    async def test_ssh_command_pins_the_pod_host_key(self, temp_dir, monkeypatch):
-        # ssh-keygen runs as a host program, with the host's environment;
-        # Windows' OpenSSH fails without its system variables.
-        for name, value in _HOST_ENVIRONMENT.items():
-            monkeypatch.setenv(name, value)
-        env = _make_gke_compose_env(temp_dir)
-        dind = env._dind
-        authorized_key, host_key = await dind._create_ssh_keys()
-        dind._pin_host_key("10.0.0.7")
-
-        args = dind._ssh_command("docker info")
-
-        assert authorized_key.startswith("ssh-ed25519 ")
-        assert "PRIVATE KEY" in host_key
-        assert args[-2:] == ["10.0.0.7", "sh -lc 'docker info'"]
-        assert args[args.index("-p") + 1] == "22222"
-        assert "StrictHostKeyChecking=yes" in args
-        known_hosts = next(
-            a.split("=", 1)[1] for a in args if a.startswith("UserKnownHostsFile=")
-        )
-        assert Path(known_hosts).read_text().startswith("[10.0.0.7]:22222 ssh-ed25519 ")
-
-
-@pytest.fixture
-def local_ssh_dind(temp_dir, tmp_path, monkeypatch):
-    """A DinD helper whose ``ssh`` runs the remote command on this machine."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    fake_ssh = bin_dir / "ssh"
-    fake_ssh.write_text(
-        '#!/bin/sh\nexport COPYFILE_DISABLE=1\nfor last; do :; done\nexec sh -c "$last"\n'
-    )
-    fake_ssh.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    dind = _make_gke_compose_env(temp_dir)._dind
-    dind._ssh_keys = tempfile.TemporaryDirectory()
-    dind._pod_ip = "127.0.0.1"
-    yield dind
-    dind._ssh_keys.cleanup()
-
-
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="the local ssh stand-in is a POSIX shell script",
-)
-class TestGKEDinDSSHTransfers:
-    """Bytes, exit codes and deadlines through the SSH subprocess."""
-
-    async def test_directory_round_trip_keeps_every_byte(
-        self, local_ssh_dind, tmp_path
-    ):
-        source = tmp_path / "source"
-        (source / "kit" / "check").mkdir(parents=True)
-        (source / "empty").mkdir()
-        payloads = {
-            "recording.mp4": os.urandom(3 * 1024 * 1024),
-            "kit/check/kit.log.gz": gzip.compress("✓ passed\n".encode() * 5000),
-            "kit/check.log": ("✓" * 40000).encode(),
-            "reward.json": b'{"reward": 1}',
-        }
-        for name, data in payloads.items():
-            (source / name).write_bytes(data)
-        (source / "run.sh").write_text("#!/bin/sh\n")
-        (source / "run.sh").chmod(0o755)
-        remote = tmp_path / "remote"
-
-        await local_ssh_dind._tar_upload_dir(source, str(remote))
-        back = tmp_path / "back"
-        await local_ssh_dind._tar_download_dir(str(remote), back)
-
-        for name, data in payloads.items():
-            assert (back / name).read_bytes() == data
-        assert (back / "empty").is_dir()
-        assert os.access(back / "run.sh", os.X_OK)
-
-    async def test_file_round_trip_keeps_every_byte(self, local_ssh_dind, tmp_path):
-        data = os.urandom(1024 * 1024)
-        source = tmp_path / "blob.bin"
-        source.write_bytes(data)
-        remote = tmp_path / "remote" / "blob.bin"
-
-        await local_ssh_dind._tar_upload_file(source, str(remote))
-        back = tmp_path / "back" / "copy.bin"
-        await local_ssh_dind._tar_download_file(str(remote), back)
-
-        assert back.read_bytes() == data
-
-    async def test_pod_exec_returns_exit_code_and_output(self, local_ssh_dind):
-        result = await local_ssh_dind._pod_exec("echo out; echo err >&2; exit 7")
-
-        assert (result.return_code, result.stdout, result.stderr) == (
-            7,
-            "out\n",
-            "err\n",
-        )
-
-    async def test_failed_download_raises_with_the_exit_code(
-        self, local_ssh_dind, tmp_path
-    ):
-        with pytest.raises(RuntimeError, match="exit code"):
-            await local_ssh_dind._tar_download_dir(
-                str(tmp_path / "missing"), tmp_path / "x"
-            )
-
-    async def test_pod_exec_deadline_stops_the_ssh_process(self, local_ssh_dind):
-        local_ssh_dind._ssh_command = lambda command: ["sleep", "5"]
-        started = time.monotonic()
-        result = await local_ssh_dind._pod_exec("sleep 5", timeout_sec=0.3)
-
-        assert result.return_code == 124
-        assert time.monotonic() - started < 2

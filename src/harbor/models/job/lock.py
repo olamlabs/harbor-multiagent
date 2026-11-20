@@ -220,7 +220,10 @@ class TrialLock(BaseModel):
             self.environment_build_timeout_multiplier,
             _lock_list_equality_key(self.extra_instructions),
             _frozen_value(self.agent, exclude={"skills"}),
-            tuple(_frozen_value(participant) for participant in self.participants),
+            tuple(
+                _frozen_value(participant)
+                for participant in sorted(self.participants, key=lambda p: p.seat)
+            ),
             _user_agent_equality_key(
                 self.user_agent, bridge_input_names=set(self.bridge_inputs)
             ),
