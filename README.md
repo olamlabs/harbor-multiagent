@@ -11,10 +11,12 @@ By [Olam Labs](https://olamlabs.ai). Not an official Harbor project.
 ## Install
 
 ```bash
-uv tool install git+https://github.com/olamlabs/harbor-multiagent
+uv tool install harbor-multiagent
 ```
 
-This installs the `harbor` command in place of an installed Harbor.
+This installs the `harbor` command in place of an installed Harbor; remove
+Harbor first (`uv tool uninstall harbor`), since both provide the `harbor`
+command and Python package.
 Single-agent tasks run unchanged.
 
 ## Example

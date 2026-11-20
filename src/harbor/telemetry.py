@@ -538,14 +538,14 @@ def _install_id_path() -> Path:
 
 def _harbor_version() -> str:
     try:
-        return version("harbor")
+        return version("harbor-multiagent")
     except PackageNotFoundError:
         return "unknown"
 
 
 def _install_source() -> str:
     try:
-        harbor_distribution = distribution("harbor")
+        harbor_distribution = distribution("harbor-multiagent")
     except PackageNotFoundError:
         return _source_import_install_source()
 

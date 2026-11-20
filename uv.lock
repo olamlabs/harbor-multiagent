@@ -18,9 +18,9 @@ resolution-markers = [
 
 [manifest]
 members = [
-    "harbor",
     "harbor-atif2otel",
     "harbor-langsmith",
+    "harbor-multiagent",
     "harbor-rewardkit",
 ]
 
@@ -1917,7 +1917,66 @@ wheels = [
 ]
 
 [[package]]
-name = "harbor"
+name = "harbor-atif2otel"
+version = "0.1.1"
+source = { editable = "packages/harbor-atif2otel" }
+dependencies = [
+    { name = "opentelemetry-proto" },
+]
+
+[package.optional-dependencies]
+plugin = [
+    { name = "harbor-multiagent" },
+]
+test = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "harbor-multiagent", marker = "extra == 'plugin'", editable = "." },
+    { name = "opentelemetry-proto", specifier = ">=1.42.1" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=8.4.1" },
+]
+provides-extras = ["test", "plugin"]
+
+[[package]]
+name = "harbor-framework-client"
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "jsonschema" },
+    { name = "pydantic" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/03/68/851940528cd5bcc8aafa9b411b39bc242f4352a61d6e138ce04687d84266/harbor_framework_client-0.2.0.tar.gz", hash = "sha256:09859fe29d8530e3471fd83a7f2e1e7f6622a9d26df233a777b3e17e60888348", size = 257583, upload-time = "2026-11-19T01:37:14.682Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f5/4e/151196980be1608de9cb859fe2f59ef160d3632d7a6c4e3062ca1fac2a6c/harbor_framework_client-0.2.0-py3-none-any.whl", hash = "sha256:50593b5cb79110ca0b7cf8f9750cc4210e1f491dfc9c0a4033fdefec66743d54", size = 393306, upload-time = "2026-11-19T01:37:12.959Z" },
+]
+
+[package.optional-dependencies]
+tus = [
+    { name = "tuspy" },
+]
+
+[[package]]
+name = "harbor-langsmith"
+version = "0.3.1"
+source = { editable = "packages/harbor-langsmith" }
+dependencies = [
+    { name = "harbor-multiagent" },
+    { name = "requests" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "harbor-multiagent", editable = "." },
+    { name = "requests", specifier = ">=2.32.4" },
+]
+
+[[package]]
+name = "harbor-multiagent"
 version = "0.26.0"
 source = { editable = "." }
 dependencies = [
@@ -1972,13 +2031,11 @@ all = [
     { name = "dspy" },
     { name = "e2b" },
     { name = "google-genai" },
-    { name = "harbor-langsmith" },
     { name = "huggingface-hub" },
     { name = "hyperbrowser" },
     { name = "islo" },
     { name = "kernel" },
     { name = "kubernetes" },
-    { name = "langsmith" },
     { name = "modal" },
     { name = "novita-sandbox" },
     { name = "openai" },
@@ -2021,13 +2078,11 @@ cloud = [
     { name = "daytona" },
     { name = "dockerfile-parse" },
     { name = "e2b" },
-    { name = "harbor-langsmith" },
     { name = "huggingface-hub" },
     { name = "hyperbrowser" },
     { name = "islo" },
     { name = "kernel" },
     { name = "kubernetes" },
-    { name = "langsmith" },
     { name = "modal" },
     { name = "novita-sandbox" },
     { name = "opensandbox" },
@@ -2162,8 +2217,8 @@ vercel = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "harbor", extra = ["adapter", "cloud", "computer-1", "dspy", "huggingface", "tinker"] },
     { name = "harbor-langsmith" },
+    { name = "harbor-multiagent", extra = ["adapter", "cloud", "computer-1", "dspy", "huggingface", "tinker"] },
     { name = "harbor-rewardkit", extra = ["all"] },
     { name = "hypothesis" },
     { name = "ipykernel" },
@@ -2214,40 +2269,39 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=4.1.6,<5" },
     { name = "filelock", specifier = ">=3.29.4" },
     { name = "google-genai", marker = "extra == 'computer-1'", specifier = ">=2.3.0" },
-    { name = "harbor", extras = ["aca-sandbox"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["adapter"], marker = "extra == 'all'" },
-    { name = "harbor", extras = ["beam"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["blaxel"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["boxd"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["cloud"], marker = "extra == 'all'" },
-    { name = "harbor", extras = ["computer-1"], marker = "extra == 'all'" },
-    { name = "harbor", extras = ["cua"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["cwsandbox"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["daytona"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["dspy"], marker = "extra == 'all'" },
-    { name = "harbor", extras = ["e2b"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["ec2"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["gke"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["hf-sandbox"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["hyperbrowser"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["islo"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["kernel"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["langsmith"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["modal"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["novita"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["opensandbox"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["prime"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["runloop"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["runta"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["sail"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["sbx"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["superserve"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["tensorlake"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["tinker"], marker = "extra == 'all'" },
-    { name = "harbor", extras = ["use-computer"], marker = "extra == 'cloud'" },
-    { name = "harbor", extras = ["vercel"], marker = "extra == 'cloud'" },
     { name = "harbor-framework-client", extras = ["tus"], specifier = ">=0.2.0,<0.3.0" },
     { name = "harbor-langsmith", marker = "extra == 'langsmith'", editable = "packages/harbor-langsmith" },
+    { name = "harbor-multiagent", extras = ["aca-sandbox"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["adapter"], marker = "extra == 'all'" },
+    { name = "harbor-multiagent", extras = ["beam"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["blaxel"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["boxd"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["cloud"], marker = "extra == 'all'" },
+    { name = "harbor-multiagent", extras = ["computer-1"], marker = "extra == 'all'" },
+    { name = "harbor-multiagent", extras = ["cua"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["cwsandbox"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["daytona"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["dspy"], marker = "extra == 'all'" },
+    { name = "harbor-multiagent", extras = ["e2b"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["ec2"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["gke"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["hf-sandbox"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["hyperbrowser"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["islo"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["kernel"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["modal"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["novita"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["opensandbox"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["prime"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["runloop"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["runta"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["sail"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["sbx"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["superserve"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["tensorlake"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["tinker"], marker = "extra == 'all'" },
+    { name = "harbor-multiagent", extras = ["use-computer"], marker = "extra == 'cloud'" },
+    { name = "harbor-multiagent", extras = ["vercel"], marker = "extra == 'cloud'" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "huggingface-hub", marker = "extra == 'hf-sandbox'", specifier = ">=1.22.0" },
     { name = "hyperbrowser", marker = "extra == 'hyperbrowser'", specifier = ">=1.5.0" },
@@ -2304,13 +2358,13 @@ provides-extras = ["huggingface", "cua", "adapter", "langsmith", "fabric", "e2b"
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "harbor", extras = ["adapter"] },
-    { name = "harbor", extras = ["cloud"] },
-    { name = "harbor", extras = ["computer-1"] },
-    { name = "harbor", extras = ["dspy"] },
-    { name = "harbor", extras = ["huggingface"] },
-    { name = "harbor", extras = ["tinker"] },
     { name = "harbor-langsmith", editable = "packages/harbor-langsmith" },
+    { name = "harbor-multiagent", extras = ["adapter"] },
+    { name = "harbor-multiagent", extras = ["cloud"] },
+    { name = "harbor-multiagent", extras = ["computer-1"] },
+    { name = "harbor-multiagent", extras = ["dspy"] },
+    { name = "harbor-multiagent", extras = ["huggingface"] },
+    { name = "harbor-multiagent", extras = ["tinker"] },
     { name = "harbor-rewardkit", extras = ["all"], editable = "packages/rewardkit" },
     { name = "hypothesis", specifier = ">=6.155.0" },
     { name = "ipykernel", specifier = ">=6.30.1" },
@@ -2322,65 +2376,6 @@ dev = [
     { name = "ty", specifier = ">=0.0.49" },
 ]
 lint = [{ name = "ruff", specifier = ">=0.15.17" }]
-
-[[package]]
-name = "harbor-atif2otel"
-version = "0.1.1"
-source = { editable = "packages/harbor-atif2otel" }
-dependencies = [
-    { name = "opentelemetry-proto" },
-]
-
-[package.optional-dependencies]
-plugin = [
-    { name = "harbor" },
-]
-test = [
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "harbor", marker = "extra == 'plugin'", editable = "." },
-    { name = "opentelemetry-proto", specifier = ">=1.42.1" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=8.4.1" },
-]
-provides-extras = ["test", "plugin"]
-
-[[package]]
-name = "harbor-framework-client"
-version = "0.2.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "httpx" },
-    { name = "jsonschema" },
-    { name = "pydantic" },
-    { name = "requests" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/03/68/851940528cd5bcc8aafa9b411b39bc242f4352a61d6e138ce04687d84266/harbor_framework_client-0.2.0.tar.gz", hash = "sha256:09859fe29d8530e3471fd83a7f2e1e7f6622a9d26df233a777b3e17e60888348", size = 257583, upload-time = "2026-11-19T01:37:14.682Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f5/4e/151196980be1608de9cb859fe2f59ef160d3632d7a6c4e3062ca1fac2a6c/harbor_framework_client-0.2.0-py3-none-any.whl", hash = "sha256:50593b5cb79110ca0b7cf8f9750cc4210e1f491dfc9c0a4033fdefec66743d54", size = 393306, upload-time = "2026-11-19T01:37:12.959Z" },
-]
-
-[package.optional-dependencies]
-tus = [
-    { name = "tuspy" },
-]
-
-[[package]]
-name = "harbor-langsmith"
-version = "0.3.1"
-source = { editable = "packages/harbor-langsmith" }
-dependencies = [
-    { name = "harbor" },
-    { name = "requests" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "harbor", editable = "." },
-    { name = "requests", specifier = ">=2.32.4" },
-]
 
 [[package]]
 name = "harbor-rewardkit"

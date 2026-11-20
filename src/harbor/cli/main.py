@@ -44,7 +44,7 @@ from harbor.telemetry import (
 
 def version_callback(value: bool) -> None:
     if value:
-        print(version("harbor"))
+        print(version("harbor-multiagent"))
         raise typer.Exit()
 
 

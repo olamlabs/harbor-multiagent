@@ -692,7 +692,7 @@ def _get_harbor_info() -> HarborLockInfo:
 
 def _get_harbor_version() -> str | None:
     try:
-        return version("harbor")
+        return version("harbor-multiagent")
     except PackageNotFoundError:
         return None
 
@@ -744,7 +744,7 @@ def _get_harbor_is_editable_install() -> bool | None:
 
 def _get_harbor_direct_url_data() -> dict[str, Any] | None:
     try:
-        dist = distribution("harbor")
+        dist = distribution("harbor-multiagent")
     except PackageNotFoundError:
         return None
 
