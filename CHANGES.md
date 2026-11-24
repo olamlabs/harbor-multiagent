@@ -135,6 +135,29 @@ names the agent's error in `exception_info`; the agent's timing stays in
 | `src/harbor/trial/trial.py` | `_run_step_verifier` records the verifier's exception on the step whether or not the step's agent raised. |
 | `tests/unit/test_single_step_trial.py`, `tests/unit/test_multi_step_run_step.py` | Cover a verifier timeout after an agent timeout, in both verifier modes. |
 
+## Verifier logs after a timeout
+
+Original Harbor downloads an unmounted verifier directory only after the test
+script returns. The trial's verifier timeout cancels that execution, skipping
+the download before the environment is stopped. Partial stdout and metrics are
+then lost.
+
+The trial downloads the verifier's logs after timeout cancellation completes and
+before raising `VerifierTimeoutError`, using the same mount check, log filters
+and download operations as successful verification. This covers shared and
+separate verifier environments and multi-step trials. A reward file is retained
+as an artifact but is never parsed after a timeout. Download failures are logged
+without replacing the timeout. A download already started during verification
+is not restarted if the timeout interrupts it. No download deadline is added.
+
+Tradeoff: reporting a verifier timeout waits for artifact download to finish.
+
+| File | Why |
+|---|---|
+| `src/harbor/verifier/base.py`, `src/harbor/verifier/verifier.py` | Move the existing verifier-directory download into `BaseVerifier.download_logs` so normal verification and timeout recovery use one implementation. Normal verification keeps its existing `DownloadVerifierDirError` classification. |
+| `src/harbor/trial/trial.py` | `_verify_with_timeout` downloads logs after cancellation and keeps the typed timeout even if downloading fails. |
+| `tests/unit/test_verifier.py`, `tests/unit/test_trial_verifier_separate.py` | Cover mounted and unmounted logs, filters, download failures, cancellation ordering, no restart of an interrupted download and retained unparsed rewards in single-step and multi-step trials with both verifier environment modes. |
+
 ## New files
 
 | File | What |

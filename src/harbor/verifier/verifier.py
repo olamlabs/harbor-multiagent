@@ -271,30 +271,12 @@ class Verifier(BaseVerifier):
             env=env,
         )
 
-        if not self.environment.is_path_mounted(
-            env_paths.verifier_dir, self.trial_paths.verifier_dir
-        ):
-            try:
-                if self.include_logs or self.exclude_logs:
-                    await self.environment.download_dir_filtered(
-                        source_dir=str(env_paths.verifier_dir),
-                        target_dir=self.trial_paths.verifier_dir,
-                        include=self.include_logs or None,
-                        exclude=self.exclude_logs or None,
-                        protect=[
-                            self.trial_paths.reward_text_path.name,
-                            self.trial_paths.reward_json_path.name,
-                        ],
-                    )
-                else:
-                    await self.environment.download_dir(
-                        source_dir=str(env_paths.verifier_dir),
-                        target_dir=self.trial_paths.verifier_dir,
-                    )
-            except Exception as e:
-                raise DownloadVerifierDirError(
-                    "Failed to download verifier directory from environment"
-                ) from e
+        try:
+            await self.download_logs()
+        except Exception as exc:
+            raise DownloadVerifierDirError(
+                "Failed to download verifier directory from environment"
+            ) from exc
 
         if self.trial_paths.reward_json_path.exists():
             rewards = self._parse_reward_json()

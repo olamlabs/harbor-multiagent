@@ -1016,6 +1016,12 @@ class Trial(ABC):
         except EnvironmentStartTimeoutError:
             raise
         except TimeoutError as exc:
+            try:
+                await verifier.download_logs()
+            except Exception:
+                self.logger.error(
+                    "Failed to download verifier logs after timeout", exc_info=True
+                )
             raise VerifierTimeoutError(
                 f"Verifier execution timed out after {timeout_sec} seconds"
             ) from exc
