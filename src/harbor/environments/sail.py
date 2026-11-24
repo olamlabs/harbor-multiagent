@@ -558,13 +558,6 @@ class _SailDinD(DinDComposeOps, _SailStrategy):
             "The Sailbox's Docker daemon", lambda: self._host_exec("docker info")
         )
 
-    async def _wait_for_main_container(self) -> None:
-        """Wait for the main service to take commands."""
-        await self._wait_until(
-            "The main service",
-            lambda: self._compose_exec(["exec", "-T", MAIN_SERVICE_NAME, "true"]),
-        )
-
     async def _stage_docker_login(self) -> None:
         """Give the VM's Docker the logins in ``docker_config_path``, as the
         local docker environment uses the host's."""
@@ -621,13 +614,12 @@ class _SailDinD(DinDComposeOps, _SailStrategy):
 
         env.logger.debug("Starting compose services inside the Sailbox...")
         result = await self._compose_exec(
-            ["up", "-d"], timeout_sec=env._build_timeout_sec
+            ["up", "--detach", "--wait"], timeout_sec=env._build_timeout_sec
         )
         if result.return_code != 0:
             raise RuntimeError(
                 f"docker compose up failed: {result.stdout} {result.stderr}"
             )
-        await self._wait_for_main_container()
 
         policy = env._to_egress_policy(env.network_policy)
         if policy != EgressPolicy.allow_all():
