@@ -160,7 +160,7 @@ class SSHAccess:
             await stop_process(process)
 
     async def run(
-        self, command: str, *, input: bytes | None = None, timeout: float = 15
+        self, command: str, *, input: bytes | None = None, timeout: float | None = 15
     ) -> bytes:
         async with self.process(command) as process:
             async with asyncio.timeout(timeout):
