@@ -6,7 +6,9 @@ import contextlib
 import json
 import logging
 import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -1014,9 +1016,14 @@ class TestExec:
 
     def test_cancelled_scope_can_already_be_removed(self, temp_dir):
         scope = SailExecScope(["true"])
-        scope.path = str(temp_dir / "removed-scope")
+        scope.path = (temp_dir / "removed-scope").as_posix()
+        argv = scope.cancel_argv
+        if sys.platform == "win32":
+            git = shutil.which("git")
+            assert git is not None
+            argv[0] = str(Path(git).resolve().parent.parent / "bin" / "bash.exe")
 
-        result = subprocess.run(scope.cancel_argv, capture_output=True, timeout=5)
+        result = subprocess.run(argv, capture_output=True, timeout=5)
 
         assert result.returncode == 0
         assert not Path(scope.path).exists()
