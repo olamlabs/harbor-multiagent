@@ -4,9 +4,7 @@ import contextlib
 import json
 import logging
 import shutil
-import tarfile
-from io import BytesIO
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import PropertyMock, patch
 
@@ -26,7 +24,7 @@ from harbor.models.trajectories import (
 )
 from harbor.trial.sync_trajectory import (
     _copy_referenced_media,
-    _download_trajectory,
+    _mirror_session_logs,
     _write_trajectory,
     sync_trajectory,
 )
@@ -66,8 +64,9 @@ def sync(request, tmp_path, monkeypatch):
     source.touch()
     closed = []
     synced = asyncio.Event()
+    received = []
 
-    async def run(command):
+    async def run(command, *, timeout=15):
         # Execute the actual archive command against a local fixture;
         # SSH transport itself is covered by environments/test_ssh.py.
         process = await asyncio.create_subprocess_exec(
@@ -80,6 +79,7 @@ def sync(request, tmp_path, monkeypatch):
         stdout, stderr = await process.communicate()
         assert process.returncode == 0, stderr.decode()
         synced.set()
+        received.append((stdout, timeout))
         return stdout
 
     access = SimpleNamespace(run=run)
@@ -115,14 +115,26 @@ def sync(request, tmp_path, monkeypatch):
             access=access,
             closed=closed,
             synced=synced,
+            received=received,
+            logs_dir=tmp_path / "mirror",
         )
 
 
-async def test_preview_reuses_native_converter_and_recovers_partial_writes(sync):
+async def download(sync):
+    """One poll: extend the mirror, then publish when it changed."""
+    if await _mirror_session_logs(
+        sync.access,
+        PurePosixPath(sync.remote.as_posix()),
+        sync.logs_dir / "sessions",
+    ):
+        _write_trajectory(sync.agent, sync.directory, sync.logs_dir)
+
+
+async def test_preview_reuses_native_converter_and_holds_back_partial_lines(sync):
     source, agent = sync.source, sync.agent
     first = (json.dumps(native_message(type(agent), "First")) + "\n").encode()
     source.write_bytes(first)
-    await _download_trajectory(sync.access, agent, sync.directory)
+    await download(sync)
     path = sync.directory / "trajectory.json"
     preview = json.loads(path.read_text(encoding="utf-8"))
     expected = agent.convert_trajectory(sync.remote.parent).to_json_dict()
@@ -133,21 +145,43 @@ async def test_preview_reuses_native_converter_and_recovers_partial_writes(sync)
     ).encode()
     split = last.index("é".encode()) + 1
     source.write_bytes(first + last[:split])
-    with pytest.raises(UnicodeError):
-        await _download_trajectory(sync.access, agent, sync.directory)
+    await download(sync)
+    mirrored = sync.logs_dir / "sessions" / source.relative_to(sync.remote)
+    assert mirrored.read_bytes() == first
     assert json.loads(path.read_text(encoding="utf-8")) == preview
+
     source.write_bytes(first + last)
-    # Reconnects require no local offsets or cached native logs.
-    await _download_trajectory(sync.access, agent, sync.directory)
+    await download(sync)
+    assert mirrored.read_bytes() == first + last
     assert json.loads(path.read_text(encoding="utf-8"))["steps"][-1][
         "message"
     ].endswith("café 世界")
 
     source.write_text(json.dumps(native_message(type(agent), "New")) + "\n")
-    await _download_trajectory(sync.access, agent, sync.directory)
+    await download(sync)
     assert [
         s["message"] for s in json.loads(path.read_text(encoding="utf-8"))["steps"]
     ] == ["New"]
+
+
+async def test_mirror_reads_only_what_the_logs_gained(sync):
+    first = (json.dumps(native_message(type(sync.agent), "First")) + "\n").encode()
+    second = (json.dumps(native_message(type(sync.agent), "Second")) + "\n").encode()
+    sync.source.write_bytes(first)
+    await download(sync)
+    sync.source.write_bytes(first + second)
+    sync.received.clear()
+    await download(sync)
+    _, appended = sync.received
+    assert appended == (second, None)
+
+    sync.received.clear()
+    assert not await _mirror_session_logs(
+        sync.access,
+        PurePosixPath(sync.remote.as_posix()),
+        sync.logs_dir / "sessions",
+    )
+    assert len(sync.received) == 1
 
 
 async def test_download_includes_new_transcripts_and_excludes_secrets(
@@ -162,10 +196,11 @@ async def test_download_includes_new_transcripts_and_excludes_secrets(
     def convert(logs_dir):
         snapshots.append({p.name for p in logs_dir.rglob("*") if p.is_file()})
 
+    sync.source.write_text("{}\n")
     monkeypatch.setattr(sync.agent, "convert_trajectory", convert)
-    await _download_trajectory(sync.access, sync.agent, sync.directory)
+    await download(sync)
     subagent.unlink()
-    await _download_trajectory(sync.access, sync.agent, sync.directory)
+    await download(sync)
     assert snapshots == [{"session.jsonl", "agent-one.jsonl"}, {"session.jsonl"}]
 
 
@@ -199,20 +234,18 @@ def _image_tool_call_events(image_bytes: bytes) -> list[dict]:
     ]
 
 
-def _session_archive(tmp_path, events: list[dict]) -> bytes:
-    session = tmp_path / "remote" / "2026" / "01" / "01" / "session.jsonl"
+def _session_logs(tmp_path, events: list[dict]) -> Path:
+    logs_dir = tmp_path / "mirror"
+    session = logs_dir / "sessions" / "2026" / "01" / "01" / "session.jsonl"
     session.parent.mkdir(parents=True, exist_ok=True)
     session.write_text("\n".join(json.dumps(event) for event in events) + "\n")
-    data = BytesIO()
-    with tarfile.open(fileobj=data, mode="w:gz") as archive:
-        archive.add(session, arcname="./2026/01/01/session.jsonl")
-    return data.getvalue()
+    return logs_dir
 
 
 def test_streamed_trajectory_carries_referenced_media(tmp_path):
     agent = Codex(logs_dir=tmp_path / "agent", model_name="test/model")
     image_bytes = b"\x89PNG\r\n\x1a\nstreamed"
-    data = _session_archive(
+    logs_dir = _session_logs(
         tmp_path,
         [
             {"type": "session_meta", "payload": {"id": "session"}},
@@ -221,7 +254,7 @@ def test_streamed_trajectory_carries_referenced_media(tmp_path):
     )
     step_dir = tmp_path / "steps" / "run" / "agent"
 
-    _write_trajectory(agent, step_dir, data)
+    assert _write_trajectory(agent, step_dir, logs_dir)
 
     trajectory = json.loads((step_dir / "trajectory.json").read_text())
     (part,) = trajectory["steps"][0]["observation"]["results"][0]["content"]
@@ -230,8 +263,8 @@ def test_streamed_trajectory_carries_referenced_media(tmp_path):
     assert (agent.logs_dir / part["source"]["path"]).read_bytes() == image_bytes
     assert not list(step_dir.glob("images/*.tmp"))
 
-    _write_trajectory(agent, step_dir, data)
-    _write_trajectory(agent, agent.logs_dir, data)
+    _write_trajectory(agent, step_dir, logs_dir)
+    _write_trajectory(agent, agent.logs_dir, logs_dir)
     assert len(list((step_dir / "images").iterdir())) == 1
     assert len(list((agent.logs_dir / "images").iterdir())) == 1
 
@@ -361,7 +394,7 @@ def test_failed_media_copy_keeps_the_last_complete_trajectory(tmp_path, monkeypa
             for part in result["content"]
         ]
 
-    _write_trajectory(agent, step_dir, _session_archive(tmp_path, [meta, *first]))
+    _write_trajectory(agent, step_dir, _session_logs(tmp_path, [meta, *first]))
     published = (step_dir / "trajectory.json").read_text()
     assert len(image_parts()) == 1
 
@@ -369,38 +402,34 @@ def test_failed_media_copy_keeps_the_last_complete_trajectory(tmp_path, monkeypa
         raise OSError("disk full")
 
     monkeypatch.setattr(shutil, "copyfile", fail)
-    _write_trajectory(
-        agent, step_dir, _session_archive(tmp_path, [meta, *first, *second])
+    assert not _write_trajectory(
+        agent, step_dir, _session_logs(tmp_path, [meta, *first, *second])
     )
 
     assert (step_dir / "trajectory.json").read_text() == published
     assert not list(step_dir.glob("**/*.tmp"))
 
     monkeypatch.undo()
-    _write_trajectory(
-        agent, step_dir, _session_archive(tmp_path, [meta, *first, *second])
-    )
+    _write_trajectory(agent, step_dir, _session_logs(tmp_path, [meta, *first, *second]))
     parts = image_parts()
     assert len(parts) == 2
     for part in parts:
         assert (step_dir / part["source"]["path"]).is_file()
 
 
-def test_invalid_archives_preserve_preview_and_cannot_escape(tmp_path):
-    preview = tmp_path / "trajectory.json"
-    preview.write_text('{"steps":[]}')
-    with pytest.raises(tarfile.ReadError):
-        _write_trajectory(None, tmp_path, b"truncated download")
-    data = BytesIO()
-    with tarfile.open(fileobj=data, mode="w:gz") as archive:
-        member = tarfile.TarInfo(str(tmp_path / "escape.jsonl"))
-        member.type = tarfile.SYMTYPE
-        member.linkname = "/etc/passwd"
-        archive.addfile(member)
-    with pytest.raises(tarfile.FilterError):
-        _write_trajectory(None, tmp_path, data.getvalue())
-    assert not (tmp_path / "escape.jsonl").exists()
-    assert json.loads(preview.read_text(encoding="utf-8")) == {"steps": []}
+async def test_mirror_ignores_paths_outside_the_session_dir(tmp_path):
+    commands = []
+
+    async def run(command, *, timeout=15):
+        commands.append(command)
+        return b"5 ../escape.jsonl\n5 /etc/escape.jsonl\n10 total\n"
+
+    mirror = tmp_path / "mirror" / "sessions"
+    assert not await _mirror_session_logs(
+        SimpleNamespace(run=run), PurePosixPath("/sessions"), mirror
+    )
+    assert len(commands) == 1
+    assert not list(tmp_path.rglob("*.jsonl"))
 
 
 @pytest.mark.parametrize("error", [TimeoutError, asyncio.CancelledError])
@@ -421,7 +450,7 @@ async def test_sync_preserves_agent_error_and_finalizes(sync, error):
 
 @pytest.mark.parametrize("failure", ["ssh", "disk"])
 async def test_sync_failure_does_not_fail_agent(sync, monkeypatch, failure):
-    async def unavailable(command):
+    async def unavailable(command, *, timeout=15):
         sync.synced.set()
         raise OSError("Unavailable")
 
