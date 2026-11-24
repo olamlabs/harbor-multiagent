@@ -1819,17 +1819,19 @@ class TestDinDStart:
             env.environment_dir, "/harbor/environment"
         )
 
-    async def test_compose_wait_uses_the_build_timeout(self, temp_dir, sdk):
+    async def test_compose_wait_uses_the_build_timeout(
+        self, temp_dir, sdk, monkeypatch
+    ):
         env = _make_env(temp_dir, compose=True)
         env.task_env_config.build_timeout_sec = 73
+        execute = AsyncMock(wraps=env._sdk_exec)
+        monkeypatch.setattr(env, "_sdk_exec", execute)
 
         await env.start(force_build=False)
 
-        up = next(
-            call for call in sdk.sailbox.run.aio.await_args_list if "up" in call.args[0]
-        )
+        up = next(call for call in execute.await_args_list if "up" in call.args[0])
         assert up.args[0][-3:] == ["up", "--detach", "--wait"]
-        assert up.kwargs["timeout"] == 73
+        assert up.kwargs["timeout_sec"] == 73
 
     async def test_unhealthy_service_preserves_compose_output(self, temp_dir, sdk):
         env = _make_env(temp_dir, compose=True)
