@@ -6,6 +6,9 @@ import contextlib
 import json
 import logging
 import shlex
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -28,6 +31,7 @@ from harbor.environments.sail import (
     _referenced_env_names,
 )
 from harbor.environments.ssh import SSHAccessError, StreamHandle
+from harbor.environments.sail_exec import SailExecScope
 from harbor.models.task.config import (
     EnvironmentConfig,
     HealthcheckConfig,
@@ -137,7 +141,7 @@ def _run_result(
     timed_out: bool = False,
     stdout_truncated: bool = False,
 ) -> SimpleNamespace:
-    """The fields of a ``sail.Sailbox.run`` result."""
+    """The fields of a completed Sail exec result."""
     return SimpleNamespace(
         stdout=stdout,
         stderr=stderr,
@@ -169,10 +173,25 @@ class _FileStream:
             raise self._error
 
 
+def _exec_argv(argv: list[str]) -> list[str]:
+    assert argv[:2] == ["bash", "-c"]
+    assert argv[3] == "harbor-exec"
+    assert argv[4].startswith("/tmp/harbor-exec-")
+    scope = argv[4]
+    command = argv[5:]
+    barrier = 'kill -STOP $$; exec "$@"'
+    if barrier in command:
+        index = command.index(barrier)
+        assert command[index - 2 : index] == ["sh", "-c"]
+        assert command[index + 1] == scope
+        command = command[: index - 2] + command[index + 2 :]
+    return command
+
+
 def _compose_commands(sdk: SimpleNamespace) -> list[list[str]]:
     """Each ``docker compose`` command run on the VM, from its subcommand on."""
     commands = []
-    for call in sdk.sailbox.run.aio.await_args_list:
+    for call in sdk.run.await_args_list:
         argv = call.args[0]
         if argv[:2] != ["/usr/bin/docker", "compose"]:
             continue
@@ -189,7 +208,7 @@ def _fail_when(sdk: SimpleNamespace, matches, **fields) -> None:
     async def run(argv, **kwargs):
         return _run_result(**fields) if matches(argv) else _run_result()
 
-    sdk.sailbox.run.aio.side_effect = run
+    sdk.run.side_effect = run
 
 
 def _compose_up_failure(**fields) -> Exception:
@@ -210,11 +229,21 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         )
     )
     sailbox.run.aio = AsyncMock(return_value=_run_result())
-    sailbox.exec.aio = AsyncMock()
+    run = AsyncMock(return_value=_run_result())
+
+    async def execute(argv, **kwargs):
+        result = await run(_exec_argv(argv), **kwargs)
+        process = MagicMock()
+        process.wait = AsyncMock(return_value=result)
+        process.cancel = AsyncMock()
+        return process
+
+    sailbox.exec.aio = AsyncMock(side_effect=execute)
     sailbox.set_egress_policy.aio = AsyncMock()
     sailbox.terminate.aio = AsyncMock()
     sailbox.sleep.aio = AsyncMock()
     sailbox.fs.mkdir.aio = AsyncMock()
+    sailbox.fs.remove.aio = AsyncMock()
     sailbox.fs.read.aio = AsyncMock(return_value=b"ssh-ed25519 AAAA test-host\n")
     sailbox.fs.upload_file.aio = AsyncMock()
     sailbox.fs.download_file.aio = AsyncMock()
@@ -241,6 +270,7 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         Sailbox=sailbox_cls,
         image=image,
         sailbox=sailbox,
+        run=run,
     )
 
 
@@ -526,7 +556,7 @@ class TestDirectStart:
         )
         assert env._sailbox is sdk.sailbox
         sdk.sailbox.fs.mkdir.aio.assert_not_awaited()
-        sdk.sailbox.run.aio.assert_not_awaited()
+        sdk.run.assert_not_awaited()
 
     async def test_force_build_creates_from_the_rebuilt_image(self, temp_dir, sdk):
         env = _make_env(temp_dir)
@@ -543,7 +573,7 @@ class TestDirectStart:
             {"type": "bind", "source": "/host/agent", "target": "/logs/agent"},
         ]
         env = _make_env(temp_dir, mounts=mounts)
-        sdk.sailbox.run.aio.return_value = _run_result(1, stderr="chmod: failed")
+        sdk.run.return_value = _run_result(1, stderr="chmod: failed")
 
         with pytest.raises(RuntimeError, match="log directories.*chmod: failed"):
             await env.start(force_build=False)
@@ -626,8 +656,9 @@ class TestDirectStart:
 
         await env.start(force_build=False)
 
-        sdk.sailbox.fs.mkdir.aio.assert_awaited_once_with("/app")
-        assert "/logs/agent" in sdk.sailbox.run.aio.await_args.args[0][-1]
+        sdk.sailbox.fs.mkdir.aio.assert_any_await("/app")
+        assert sdk.sailbox.fs.mkdir.aio.await_count == 2
+        assert "/logs/agent" in sdk.run.await_args.args[0][-1]
 
     async def test_app_name_and_max_lifetime_are_configurable(self, temp_dir, sdk):
         env = _make_env(
@@ -958,20 +989,60 @@ class TestSSHStream:
 
 
 class TestExec:
+    async def test_completed_exec_removes_scope_after_exit(self, temp_dir, sdk):
+        env = _make_env(temp_dir)
+        env._sailbox = sdk.sailbox
+        events = []
+        process = MagicMock()
+        process.wait = AsyncMock(
+            side_effect=lambda: events.append("wait") or _run_result()
+        )
+        process.close.side_effect = lambda: events.append("close")
+        sdk.sailbox.exec.aio.side_effect = None
+        sdk.sailbox.exec.aio.return_value = process
+        sdk.sailbox.fs.mkdir.aio.side_effect = lambda *args, **kwargs: events.append(
+            "mkdir"
+        )
+        sdk.sailbox.fs.remove.aio.side_effect = lambda *args, **kwargs: events.append(
+            "remove"
+        )
+
+        await env.exec("true", user="agent")
+
+        scope = sdk.sailbox.exec.aio.await_args.args[0][4]
+        assert events == ["mkdir", "wait", "close", "remove"]
+        sdk.sailbox.fs.mkdir.aio.assert_awaited_once_with(scope, user="agent")
+        sdk.sailbox.fs.remove.aio.assert_awaited_once_with(scope, user="root")
+
+    def test_cancelled_scope_can_already_be_removed(self, temp_dir):
+        scope = SailExecScope(["true"])
+        scope.path = (temp_dir / "removed-scope").as_posix()
+        argv = scope.cancel_argv
+        if sys.platform == "win32":
+            git = shutil.which("git")
+            assert git is not None
+            argv[0] = str(Path(git).resolve().parent.parent / "bin" / "bash.exe")
+
+        result = subprocess.run(argv, capture_output=True, timeout=5)
+
+        assert result.returncode == 0
+        assert not Path(scope.path).exists()
+
     async def test_runs_bash_in_workdir_with_merged_env(self, temp_dir, sdk):
         env = _make_env(temp_dir, workdir="/app", persistent_env={"KEEP": "1"})
         env._sailbox = sdk.sailbox
-        sdk.sailbox.run.aio.return_value = _run_result(3, stdout="out", stderr="err")
+        sdk.run.return_value = _run_result(3, stdout="out", stderr="err")
 
         result = await env.exec(
             "echo hi", env={"FOO": "bar"}, timeout_sec=30, user="agent"
         )
 
-        sdk.sailbox.run.aio.assert_awaited_once_with(
+        sdk.run.assert_awaited_once_with(
             ["bash", "-c", "cd /app && exec bash -c 'echo hi'"],
             env={"KEEP": "1", "FOO": "bar"},
-            timeout=30,
+            timeout=None,
             user="agent",
+            output_mode="tail",
             output_buffer_bytes=64 * 1024 * 1024,
         )
         assert result == ExecResult(return_code=3, stdout="out", stderr="err")
@@ -982,7 +1053,7 @@ class TestExec:
 
         await env.exec("id")
 
-        assert sdk.sailbox.run.aio.await_args.args == (["bash", "-c", "id"],)
+        assert sdk.run.await_args.args == (["bash", "-c", "id"],)
 
     async def test_default_user_is_passed_to_sdk(self, temp_dir, sdk):
         env = _make_env(temp_dir)
@@ -991,24 +1062,33 @@ class TestExec:
 
         await env.exec("id")
 
-        assert sdk.sailbox.run.aio.await_args.kwargs["user"] == "agent"
+        assert sdk.run.await_args.kwargs["user"] == "agent"
 
     async def test_timeout_raises(self, temp_dir, sdk):
         env = _make_env(temp_dir)
         env._sailbox = sdk.sailbox
-        sdk.sailbox.run.aio.return_value = _run_result(124, timed_out=True)
+        process = MagicMock()
+        process.wait = AsyncMock(return_value=_run_result(137))
+        process.cancel = AsyncMock()
+        sdk.sailbox.exec.aio.side_effect = None
+        sdk.sailbox.exec.aio.return_value = process
 
-        with pytest.raises(RuntimeError, match="timed out after 5 seconds"):
-            await env.exec("sleep 10", timeout_sec=5)
+        with pytest.raises(RuntimeError, match="timed out after 0 seconds") as info:
+            await env.exec("sleep 10", timeout_sec=0)
+
+        assert isinstance(info.value.__cause__, TimeoutError)
+        assert sdk.sailbox.exec.aio.await_args.kwargs["timeout"] is None
+        sdk.sailbox.run.aio.assert_awaited_once()
+        process.cancel.assert_awaited_once_with(force=True)
+        process.wait.assert_awaited_once_with()
+        process.close.assert_called_once_with()
 
     async def test_truncated_output_is_returned_with_a_warning(
         self, temp_dir, sdk, caplog
     ):
         env = _make_env(temp_dir)
         env._sailbox = sdk.sailbox
-        sdk.sailbox.run.aio.return_value = _run_result(
-            stdout="tail", stdout_truncated=True
-        )
+        sdk.run.return_value = _run_result(stdout="tail", stdout_truncated=True)
 
         with caplog.at_level(logging.WARNING):
             result = await env.exec("yes")
@@ -1019,6 +1099,162 @@ class TestExec:
     async def test_before_start_raises(self, temp_dir):
         with pytest.raises(RuntimeError, match="start the environment first"):
             await _make_env(temp_dir).exec("true")
+
+    async def test_cancellation_during_launch_reclaims_remote_process(
+        self, temp_dir, sdk
+    ):
+        env = _make_env(temp_dir)
+        env._sailbox = sdk.sailbox
+        launching = asyncio.Event()
+        release_launch = asyncio.Event()
+        events = []
+        launch_tasks = []
+        process = MagicMock()
+
+        async def launch(*args, **kwargs):
+            launch_tasks.append(asyncio.current_task())
+            launching.set()
+            await release_launch.wait()
+            events.append("launched")
+            return process
+
+        async def cleanup(*args, **kwargs):
+            events.append("cleanup")
+            return _run_result()
+
+        async def cancel(**kwargs):
+            events.append("cancel")
+
+        async def wait():
+            events.append("wait")
+            return _run_result(137)
+
+        process.cancel = AsyncMock(side_effect=cancel)
+        process.wait = AsyncMock(side_effect=wait)
+        process.close.side_effect = lambda: events.append("close")
+        sdk.sailbox.exec.aio.side_effect = launch
+        sdk.sailbox.run.aio.side_effect = cleanup
+        sdk.sailbox.fs.remove.aio.side_effect = lambda *args, **kwargs: events.append(
+            "remove"
+        )
+        task = asyncio.create_task(env.exec("sleep 30"))
+        try:
+            async with asyncio.timeout(5):
+                await launching.wait()
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done()
+                assert launch_tasks[0].cancelling() == 0
+                sdk.sailbox.run.aio.assert_not_awaited()
+                release_launch.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        finally:
+            release_launch.set()
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert events == ["launched", "cleanup", "cancel", "wait", "close", "remove"]
+        process.cancel.assert_awaited_once_with(force=True)
+        process.wait.assert_awaited_once_with()
+        process.close.assert_called_once_with()
+        sdk.sailbox.run.aio.assert_awaited_once()
+        cleanup_call = sdk.sailbox.run.aio.await_args
+        assert cleanup_call.args[0][-1] == sdk.sailbox.exec.aio.await_args.args[0][4]
+        assert cleanup_call.kwargs == {"user": "root"}
+        sdk.sailbox.fs.remove.aio.assert_awaited_once_with(
+            cleanup_call.args[0][-1], user="root"
+        )
+
+    @pytest.mark.parametrize("compose", [False, True])
+    async def test_cancelled_buffered_exec_waits_for_cleanup_and_exit(
+        self, temp_dir, sdk, compose
+    ):
+        env = _make_env(temp_dir, compose=compose)
+        env._sailbox = sdk.sailbox
+        waiting = asyncio.Event()
+        cleaning = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        reaping = asyncio.Event()
+        release_reap = asyncio.Event()
+        events = []
+        process = MagicMock()
+
+        async def wait():
+            if not waiting.is_set():
+                events.append("wait")
+                waiting.set()
+                await asyncio.Event().wait()
+            events.append("reap")
+            reaping.set()
+            await release_reap.wait()
+            return _run_result(137)
+
+        async def cleanup(*args, **kwargs):
+            events.append("cleanup")
+            cleaning.set()
+            await release_cleanup.wait()
+            return _run_result()
+
+        async def cancel(**kwargs):
+            events.append("cancel")
+
+        process.wait = AsyncMock(side_effect=wait)
+        process.cancel = AsyncMock(side_effect=cancel)
+        process.close.side_effect = lambda: events.append("close")
+        sdk.sailbox.exec.aio.side_effect = None
+        sdk.sailbox.exec.aio.return_value = process
+        sdk.sailbox.run.aio.side_effect = cleanup
+        sdk.sailbox.fs.remove.aio.side_effect = lambda *args, **kwargs: events.append(
+            "remove"
+        )
+        task = asyncio.create_task(env.exec("sleep 30"))
+        try:
+            async with asyncio.timeout(5):
+                await waiting.wait()
+                task.cancel()
+                await cleaning.wait()
+                assert not task.done()
+                process.cancel.assert_not_awaited()
+                process.close.assert_not_called()
+                sdk.sailbox.fs.remove.aio.assert_not_awaited()
+                release_cleanup.set()
+                await reaping.wait()
+                assert not task.done()
+                process.close.assert_not_called()
+                sdk.sailbox.fs.remove.aio.assert_not_awaited()
+                release_reap.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        finally:
+            release_cleanup.set()
+            release_reap.set()
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert events == ["wait", "cleanup", "cancel", "reap", "close", "remove"]
+        process.cancel.assert_awaited_once_with(force=True)
+        assert process.wait.await_count == 2
+        process.close.assert_called_once_with()
+        launch = sdk.sailbox.exec.aio.await_args
+        assert launch.kwargs["output_mode"] == "tail"
+        cleanup_call = sdk.sailbox.run.aio.await_args
+        assert cleanup_call.args[0][-1] == launch.args[0][4]
+        assert "cgroup.kill" in cleanup_call.args[0][2]
+        assert cleanup_call.kwargs == {"user": "root"}
+        sdk.sailbox.fs.remove.aio.assert_awaited_once_with(
+            cleanup_call.args[0][-1], user="root"
+        )
+        command = _exec_argv(launch.args[0])
+        if compose:
+            assert command[-4:] == ["main", "bash", "-c", "sleep 30"]
+            assert 'kill -STOP $$; exec "$@"' in launch.args[0]
+        else:
+            assert command == ["bash", "-c", "sleep 30"]
 
 
 class TestStreamingExec:
@@ -1054,6 +1290,7 @@ class TestStreamingExec:
             )
         )
         process.cancel = AsyncMock()
+        sdk.sailbox.exec.aio.side_effect = None
         sdk.sailbox.exec.aio.return_value = process
 
         with env.scoped_output_callback(emit):
@@ -1075,22 +1312,24 @@ class TestStreamingExec:
         )
         assert chunks[:2] == [("stdout first", "stdout"), ("stderr first", "stderr")]
         call = sdk.sailbox.exec.aio.await_args
+        argv = _exec_argv(call.args[0])
         if compose:
-            assert call.args[0][:2] == ["/usr/bin/docker", "compose"]
-            assert call.args[0][-4:] == ["main", "bash", "-c", "command"]
-            assert "-T" in call.args[0]
-            assert "-w" in call.args[0]
-            assert "-u" in call.args[0]
+            assert argv[:2] == ["/usr/bin/docker", "compose"]
+            assert argv[-4:] == ["main", "bash", "-c", "command"]
+            assert "-T" in argv
+            assert "-w" in argv
+            assert "-u" in argv
         else:
-            assert call.args[0] == ["bash", "-c", "cd /app && exec bash -c command"]
+            assert argv == ["bash", "-c", "cd /app && exec bash -c command"]
             assert call.kwargs["user"] == "agent"
         assert call.kwargs["env"]["KEEP"] == "1"
         assert call.kwargs["env"]["FOO"] == "bar"
-        assert call.kwargs["timeout"] == 30
+        assert call.kwargs["timeout"] is None
         assert call.kwargs["output_mode"] == "pipe"
         assert call.kwargs["output_buffer_bytes"] == 64 * 1024 * 1024
         process.close.assert_called_once_with()
         process.cancel.assert_not_awaited()
+        sdk.run.assert_not_awaited()
         sdk.sailbox.run.aio.assert_not_awaited()
 
     async def test_without_callback_keeps_buffered_exec(self, temp_dir, sdk):
@@ -1099,8 +1338,10 @@ class TestStreamingExec:
 
         await env.exec("true")
 
-        sdk.sailbox.run.aio.assert_awaited_once()
-        sdk.sailbox.exec.aio.assert_not_awaited()
+        sdk.run.assert_awaited_once()
+        sdk.sailbox.exec.aio.assert_awaited_once()
+        assert sdk.sailbox.exec.aio.await_args.kwargs["output_mode"] == "tail"
+        sdk.sailbox.run.aio.assert_not_awaited()
 
     @pytest.mark.parametrize("truncated", [False, True])
     async def test_returns_sdk_result_without_replaying_it(
@@ -1124,6 +1365,7 @@ class TestStreamingExec:
                 stdout="buffered output\n", stdout_truncated=truncated
             )
         )
+        sdk.sailbox.exec.aio.side_effect = None
         sdk.sailbox.exec.aio.return_value = process
 
         with caplog.at_level(logging.WARNING), env.scoped_output_callback(emit):
@@ -1148,7 +1390,7 @@ class TestStreamingExec:
         async def output(stream):
             try:
                 reading.set()
-                if failure == "cancel":
+                if failure in {"cancel", "timeout"}:
                     await asyncio.Event().wait()
                 if failure == "reader" and stream == "stdout":
                     raise error
@@ -1163,23 +1405,24 @@ class TestStreamingExec:
         process = MagicMock()
         process.stdout = output("stdout")
         process.stderr = output("stderr")
-        process.wait = AsyncMock(
-            return_value=_run_result(124, timed_out=failure == "timeout")
-        )
+        process.wait = AsyncMock(return_value=_run_result(137))
         if failure == "wait":
-            process.wait.side_effect = error
+            process.wait.side_effect = [error, _run_result()]
         process.cancel = AsyncMock()
+        sdk.sailbox.exec.aio.side_effect = None
         sdk.sailbox.exec.aio.return_value = process
 
         with env.scoped_output_callback(emit):
-            task = asyncio.create_task(env.exec("command", timeout_sec=5))
+            task = asyncio.create_task(
+                env.exec("command", timeout_sec=0.01 if failure == "timeout" else 5)
+            )
             if failure == "cancel":
                 await reading.wait()
                 task.cancel()
             if failure == "timeout":
-                with pytest.raises(RuntimeError, match="timed out after 5 seconds"):
+                with pytest.raises(RuntimeError, match="timed out after 0.01 seconds"):
                     await task
-                process.cancel.assert_not_awaited()
+                process.cancel.assert_awaited_once_with(force=True)
             elif failure == "cancel":
                 with pytest.raises(asyncio.CancelledError):
                     await task
@@ -1197,6 +1440,55 @@ class TestStreamingExec:
 
         assert all(closed.values())
         process.close.assert_called_once_with()
+        sdk.sailbox.run.aio.assert_awaited_once()
+        cleanup = sdk.sailbox.run.aio.await_args
+        assert cleanup.args[0][-1] == sdk.sailbox.exec.aio.await_args.args[0][4]
+        assert "cgroup.kill" in cleanup.args[0][2]
+        assert cleanup.kwargs == {"user": "root"}
+        assert process.wait.await_count == (2 if failure == "wait" else 1)
+
+    @pytest.mark.parametrize("failure", ["exit", "request", "cancel", "wait"])
+    async def test_cleanup_failure_propagates_and_releases_process(
+        self, temp_dir, sdk, failure
+    ):
+        env = _make_env(temp_dir)
+        env._sailbox = sdk.sailbox
+        error = RuntimeError("cleanup failed")
+
+        async def output():
+            yield "chunk"
+
+        async def emit(text, stream):
+            raise ValueError("callback failed")
+
+        process = MagicMock()
+        process.stdout = output()
+        process.stderr = output()
+        process.cancel = AsyncMock(side_effect=error if failure == "cancel" else None)
+        process.wait = AsyncMock(
+            return_value=_run_result(), side_effect=error if failure == "wait" else None
+        )
+        sdk.sailbox.exec.aio.side_effect = None
+        sdk.sailbox.exec.aio.return_value = process
+        if failure == "exit":
+            sdk.sailbox.run.aio.return_value = _run_result(
+                1, stderr="permission denied"
+            )
+        elif failure == "request":
+            sdk.sailbox.run.aio.side_effect = error
+
+        with env.scoped_output_callback(emit), pytest.raises(RuntimeError) as info:
+            await env.exec("command")
+
+        if failure == "exit":
+            assert "terminate Sail command cgroup" in str(info.value)
+            assert "permission denied" in str(info.value)
+        else:
+            assert info.value is error
+        sdk.sailbox.run.aio.assert_awaited_once()
+        process.cancel.assert_awaited_once_with(force=True)
+        process.wait.assert_awaited_once_with()
+        process.close.assert_called_once_with()
 
 
 class TestHealthcheck:
@@ -1208,12 +1500,12 @@ class TestHealthcheck:
 
         await env.run_healthcheck(self.CHECK)
 
-        sdk.sailbox.run.aio.assert_awaited_once()
+        sdk.run.assert_awaited_once()
 
     async def test_direct_mode_failure_names_the_unrun_entrypoint(self, temp_dir, sdk):
         env = _make_env(temp_dir)
         env._sailbox = sdk.sailbox
-        sdk.sailbox.run.aio.return_value = _run_result(7)
+        sdk.run.return_value = _run_result(7)
 
         with pytest.raises(HealthcheckError) as info:
             await env.run_healthcheck(self.CHECK)
@@ -1229,7 +1521,7 @@ class TestHealthcheck:
     async def test_compose_mode_failure_is_the_generic_one(self, temp_dir, sdk):
         env = _make_env(temp_dir, compose=True)
         env._sailbox = sdk.sailbox
-        sdk.sailbox.run.aio.return_value = _run_result(7)
+        sdk.run.return_value = _run_result(7)
 
         with pytest.raises(HealthcheckError) as info:
             await env.run_healthcheck(self.CHECK)
@@ -1294,7 +1586,7 @@ class TestStop:
         sdk.sailbox.sleep.aio.assert_awaited_once()
         sdk.sailbox.terminate.aio.assert_not_awaited()
         # Compose containers sleep with the VM; nothing is torn down first.
-        sdk.sailbox.run.aio.assert_not_awaited()
+        sdk.run.assert_not_awaited()
         assert env._sailbox is None
 
     async def test_without_sailbox_is_noop(self, temp_dir):
@@ -1527,17 +1819,19 @@ class TestDinDStart:
             env.environment_dir, "/harbor/environment"
         )
 
-    async def test_compose_wait_uses_the_build_timeout(self, temp_dir, sdk):
+    async def test_compose_wait_uses_the_build_timeout(
+        self, temp_dir, sdk, monkeypatch
+    ):
         env = _make_env(temp_dir, compose=True)
         env.task_env_config.build_timeout_sec = 73
+        execute = AsyncMock(wraps=env._sdk_exec)
+        monkeypatch.setattr(env, "_sdk_exec", execute)
 
         await env.start(force_build=False)
 
-        up = next(
-            call for call in sdk.sailbox.run.aio.await_args_list if "up" in call.args[0]
-        )
+        up = next(call for call in execute.await_args_list if "up" in call.args[0])
         assert up.args[0][-3:] == ["up", "--detach", "--wait"]
-        assert up.kwargs["timeout"] == 73
+        assert up.kwargs["timeout_sec"] == 73
 
     async def test_unhealthy_service_preserves_compose_output(self, temp_dir, sdk):
         env = _make_env(temp_dir, compose=True)
@@ -1593,7 +1887,7 @@ class TestDinDStart:
 
         await env.start(force_build=False)
 
-        mkdir = sdk.sailbox.run.aio.await_args_list[-1].args[0]
+        mkdir = sdk.run.await_args_list[-1].args[0]
         assert mkdir[:2] == ["/usr/bin/docker", "compose"]
         assert mkdir[-10:] == [
             "exec",
@@ -1627,9 +1921,7 @@ class TestDinDStart:
         assert override["services"]["main"]["volumes"] == [
             {"type": "bind", "source": "/logs/agent", "target": "/logs/agent"}
         ]
-        host_commands = [
-            call.args[0][-1] for call in sdk.sailbox.run.aio.await_args_list
-        ]
+        host_commands = [call.args[0][-1] for call in sdk.run.await_args_list]
         assert "mkdir -p /logs/agent && chmod 777 /logs/agent" in host_commands
         sdk.sailbox.fs.download_dir.aio.assert_awaited_once_with(
             "/logs/agent", temp_dir / "agent"
@@ -1659,7 +1951,7 @@ class TestDinDExecRouting:
         literal = "synthetic 'quote'\n$literal"
         await env.exec("id", env={"FOO": literal, "EMPTY": ""})
 
-        call = sdk.sailbox.run.aio.await_args
+        call = sdk.run.await_args
         argv = call.args[0]
         assert argv[argv.index("exec") :] == [
             "exec",
@@ -1701,13 +1993,15 @@ class TestDinDTransfers:
         env._sailbox = sdk.sailbox
         source = temp_dir / "script.sh"
         source.write_text("#!/bin/sh\n")
+        env._sdk_exec = AsyncMock(wraps=env._sdk_exec)
 
         await env.upload_file(source, "/app/script.sh")
 
         (_source, staged), _ = sdk.sailbox.fs.upload_file.aio.await_args
-        copy, cleanup = sdk.sailbox.run.aio.await_args_list
+        copy, cleanup = sdk.run.await_args_list
         assert copy.args[0][-3:] == ["cp", staged, "main:/app/script.sh"]
-        assert copy.kwargs["timeout"] == 1800
+        assert copy.kwargs["timeout"] is None
+        assert env._sdk_exec.await_args_list[0].kwargs["timeout_sec"] == 1800
         assert cleanup.args[0][-1] == f"rm -f {staged}"
 
     async def test_failed_cleanup_does_not_fail_the_transfer(
@@ -1717,9 +2011,9 @@ class TestDinDTransfers:
         env._sailbox = sdk.sailbox
         source = temp_dir / "script.sh"
         source.write_text("#!/bin/sh\n")
-        sdk.sailbox.run.aio.side_effect = [
+        sdk.run.side_effect = [
             _run_result(),
-            _run_result(124, timed_out=True),
+            TimeoutError("cleanup timed out"),
         ]
 
         with caplog.at_level(logging.WARNING):
@@ -1730,9 +2024,9 @@ class TestDinDTransfers:
     async def test_failed_transfer_keeps_its_error_through_cleanup(self, temp_dir, sdk):
         env = _make_env(temp_dir, compose=True)
         env._sailbox = sdk.sailbox
-        sdk.sailbox.run.aio.side_effect = [
+        sdk.run.side_effect = [
             _run_result(1, stderr="no such file"),
-            _run_result(124, timed_out=True),
+            TimeoutError("cleanup timed out"),
         ]
 
         with pytest.raises(RuntimeError, match="compose cp failed.*no such file"):

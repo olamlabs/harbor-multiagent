@@ -67,6 +67,7 @@ from harbor.environments.docker.compose_env import (
 )
 from harbor.environments.docker.docker import _sanitize_docker_image_name
 from harbor.environments.options import EnvironmentOptions
+from harbor.environments.sail_exec import SailExecScope
 from harbor.environments.ssh import SSHAccess, SSHAccessError, StreamHandle, run_local
 from harbor.models.asp import ASPConfig, ASPConnection, ASPIdentityFile
 from harbor.models.environment_type import EnvironmentType
@@ -508,10 +509,18 @@ class _SailDinD(DinDComposeOps, _SailStrategy):
         env: dict[str, str] | None = None,
     ) -> ExecResult:
         """Run a docker compose subcommand on the VM."""
+        argv = self._compose_argv(subcommand)
+        compose_command = None
+        if subcommand[0] == "exec":
+            index = 1
+            while subcommand[index].startswith("-"):
+                index += 1 if subcommand[index] == "-T" else 2
+            compose_command = len(argv) - len(subcommand) + index + 1
         return await self._env._sdk_exec(
-            self._compose_argv(subcommand),
+            argv,
             env={**self._compose_env_vars(), **(env or {})},
             timeout_sec=timeout_sec,
+            compose_command=compose_command,
         )
 
     async def _ensure_main_workdir(self) -> None:
@@ -893,54 +902,72 @@ class SailEnvironment(ComposeServiceOpsMixin, BaseEnvironment):
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
         user: str | int | None = None,
+        compose_command: int | None = None,
     ) -> ExecResult:
         sailbox = self._require_sailbox()
         callback = self._output_callback()
-        if callback is None:
-            result = await sailbox.run.aio(
-                argv,
+        scope = SailExecScope(argv, compose_command)
+
+        async def start_process():
+            await sailbox.fs.mkdir.aio(scope.path, user=user)
+            return await sailbox.exec.aio(
+                scope.argv,
                 env=env,
-                timeout=timeout_sec,
+                timeout=None,
                 user=user,
-                output_buffer_bytes=_OUTPUT_BUFFER_BYTES,
-            )
-        else:
-            process = await sailbox.exec.aio(
-                argv,
-                env=env,
-                timeout=timeout_sec,
-                user=user,
-                output_mode="pipe",
+                output_mode="pipe" if callback else "tail",
                 output_buffer_bytes=_OUTPUT_BUFFER_BYTES,
             )
 
-            async def read_output(
-                chunks: AsyncGenerator[str, None], stream: OutputStream
-            ) -> None:
-                async with aclosing(chunks):
-                    async for chunk in chunks:
+        launch = asyncio.create_task(start_process())
+        process = None
+
+        async def read_output(
+            chunks: AsyncGenerator[str, None], stream: OutputStream
+        ) -> None:
+            async with aclosing(chunks):
+                async for chunk in chunks:
+                    if callback is not None:
                         await callback(chunk, stream)
 
+        try:
             try:
-                try:
-                    async with asyncio.TaskGroup() as group:
-                        group.create_task(read_output(process.stdout, "stdout"))
-                        group.create_task(read_output(process.stderr, "stderr"))
+                async with asyncio.timeout(timeout_sec):
+                    process = await asyncio.shield(launch)
+                    if callback is not None:
+                        async with asyncio.TaskGroup() as group:
+                            group.create_task(read_output(process.stdout, "stdout"))
+                            group.create_task(read_output(process.stderr, "stderr"))
                     result = await process.wait()
-                except ExceptionGroup as exc:
-                    if len(exc.exceptions) == 1:
-                        raise exc.exceptions[0] from None
-                    raise
-            except BaseException:
+            except ExceptionGroup as exc:
+                if len(exc.exceptions) == 1:
+                    raise exc.exceptions[0] from None
+                raise
+        except BaseException as exc:
+            if process is None:
+                process = await launch
+            try:
+                cleaned = await sailbox.run.aio(scope.cancel_argv, user="root")
+                if cleaned.exit_code != 0:
+                    raise RuntimeError(
+                        f"Failed to terminate Sail command cgroup: {cleaned.stderr}"
+                    )
+            finally:
                 try:
                     await process.cancel(force=True)
-                except Exception as exc:
-                    self.logger.warning("Failed to cancel Sailbox command: %s", exc)
-                raise
+                finally:
+                    await process.wait()
+            if isinstance(exc, TimeoutError):
+                raise RuntimeError(
+                    f"Command timed out after {timeout_sec} seconds"
+                ) from exc
+            raise
+        finally:
+            try:
+                if process is not None:
+                    process.close()
             finally:
-                process.close()
-        if result.timed_out:
-            raise RuntimeError(f"Command timed out after {timeout_sec} seconds")
+                await sailbox.fs.remove.aio(scope.path, user="root")
         if result.stdout_truncated or result.stderr_truncated:
             self.logger.warning(
                 f"Command output exceeded {_OUTPUT_BUFFER_BYTES // 2**20} MiB on a "
