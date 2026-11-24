@@ -795,6 +795,75 @@ async def test_separate_verifier_start_timeout(
     verifier_env.stop.assert_awaited_once_with(delete=False)
 
 
+@pytest.mark.parametrize("mode", ["shared", "separate"])
+@pytest.mark.parametrize("multi_step", [False, True])
+async def test_verifier_timeout_keeps_logs_before_environment_stop(
+    tmp_path: Path, mode: str, multi_step: bool
+):
+    task_dir = _single_step_task_with_separate_verifier(tmp_path)
+    config_path = task_dir / "task.toml"
+    config = config_path.read_text().replace(
+        "[verifier]\ntimeout_sec = 10.0",
+        f'[verifier]\ntimeout_sec = 0.01\nenvironment_mode = "{mode}"',
+    )
+    if mode == "shared":
+        config = config.replace("[verifier.environment]\n", "")
+    (task_dir / "tests" / "test.sh").write_text("#!/bin/bash\nsleep 300\n")
+    if multi_step:
+        config += '\n[[steps]]\nname = "grade"\n[steps.verifier]\ntimeout_sec = 0.01\n'
+        step_dir = task_dir / "steps" / "grade"
+        step_dir.mkdir(parents=True)
+        (step_dir / "instruction.md").write_text("Do nothing.\n")
+    config_path.write_text(config)
+
+    agent_env = _stock_mock_env()
+    verifier_env = _stock_mock_env()
+    target_env = agent_env if mode == "shared" else verifier_env
+    for env in (agent_env, verifier_env):
+        env.os = TaskOS.LINUX
+        env.is_path_mounted.return_value = False
+    cancelled = asyncio.Event()
+    events = []
+
+    async def exec_command(command, **kwargs):
+        if "test-stdout.txt" in command:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        return ExecResult(return_code=0)
+
+    async def download_dir(source_dir, target_dir):
+        if source_dir != "/logs/verifier":
+            return
+        assert cancelled.is_set()
+        events.append("download")
+        (target_dir / "test-stdout.txt").write_text("partial output\n")
+        (target_dir / "reward.txt").write_text("1")
+
+    async def stop(**kwargs):
+        events.append("stop")
+
+    target_env.exec.side_effect = exec_command
+    target_env.download_dir.side_effect = download_dir
+    target_env.stop.side_effect = stop
+    fake_create, _ = _make_factory_recorder(agent_env, [verifier_env])
+    trial = await _run_trial(task_dir, tmp_path / "trials", fake_create)
+
+    result = trial.result.step_results[0] if multi_step else trial.result
+    assert result.exception_info.exception_type == "VerifierTimeoutError"
+    assert result.verifier_result is None
+    assert trial.result.verifier_result is None
+    output_dir = (
+        trial.paths.step_verifier_dir("grade")
+        if multi_step
+        else trial.paths.verifier_dir
+    )
+    assert (output_dir / "test-stdout.txt").read_text() == "partial output\n"
+    assert (output_dir / "reward.txt").read_text() == "1"
+    assert events == ["download", "stop"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["shared", "separate"])
 @pytest.mark.parametrize(

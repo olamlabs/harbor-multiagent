@@ -5,7 +5,7 @@ import contextlib
 import shutil
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -13,6 +13,8 @@ from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.task.config import TaskOS
 from harbor.models.task.task import Task
 from harbor.models.trial.paths import TrialPaths
+from harbor.trial.errors import VerifierTimeoutError
+from harbor.trial.single_step import SingleStepTrial
 from harbor.verifier.verifier import (
     AddTestsDirError,
     RewardFileNotFoundError,
@@ -60,6 +62,133 @@ def _create_windows_task_dir(root: Path) -> Path:
         "@echo off\r\necho 1.0 > %LOGS_DIR%\\verifier\\reward.txt\r\n"
     )
     return task_dir
+
+
+@pytest.mark.parametrize("mounted", [True, False])
+@pytest.mark.parametrize("filtered", [True, False])
+async def test_timeout_downloads_logs_after_exec_cancellation(
+    tmp_path: Path, mounted: bool, filtered: bool
+):
+    paths = TrialPaths(trial_dir=tmp_path / "trial")
+    paths.mkdir()
+    remote_dir = paths.verifier_dir if mounted else tmp_path / "remote-verifier"
+    remote_dir.mkdir(exist_ok=True)
+    cancelled = asyncio.Event()
+    env = MagicMock(spec=BaseEnvironment)
+    env.os = TaskOS.LINUX
+    env.is_path_mounted.return_value = mounted
+
+    async def exec_command(command, **kwargs):
+        if "test-stdout.txt" in command:
+            (remote_dir / "test-stdout.txt").write_text("verifier started\n")
+            (remote_dir / "metrics.json").write_text('{"partial": true}')
+            (remote_dir / "reward.txt").write_text("1")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        return ExecResult(return_code=0)
+
+    async def download_dir(source_dir, target_dir, **kwargs):
+        assert cancelled.is_set()
+        assert source_dir == "/logs/verifier"
+        shutil.copytree(remote_dir, target_dir, dirs_exist_ok=True)
+
+    env.exec.side_effect = exec_command
+    env.download_dir.side_effect = download_dir
+    env.download_dir_filtered.side_effect = download_dir
+    verifier = Verifier(
+        task=Task(_create_task_dir(tmp_path)),
+        trial_paths=paths,
+        environment=env,
+        include_logs=["*.json"] if filtered else None,
+        exclude_logs=["*.tmp"] if filtered else None,
+    )
+    trial = object.__new__(SingleStepTrial)
+    trial.logger = MagicMock()
+
+    with (
+        patch.object(
+            verifier, "_parse_reward_text", side_effect=AssertionError("parsed reward")
+        ) as parse_reward,
+        pytest.raises(VerifierTimeoutError, match="timed out after 0.01 seconds"),
+    ):
+        await trial._verify_with_timeout(verifier, 0.01)
+
+    assert paths.test_stdout_path.read_text() == "verifier started\n"
+    assert (paths.verifier_dir / "metrics.json").read_text() == '{"partial": true}'
+    assert paths.reward_text_path.read_text() == "1"
+    parse_reward.assert_not_called()
+    if mounted:
+        env.download_dir.assert_not_awaited()
+        env.download_dir_filtered.assert_not_awaited()
+    elif filtered:
+        env.download_dir_filtered.assert_awaited_once_with(
+            source_dir="/logs/verifier",
+            target_dir=paths.verifier_dir,
+            include=["*.json"],
+            exclude=["*.tmp"],
+            protect=["reward.txt", "reward.json"],
+        )
+        env.download_dir.assert_not_awaited()
+    else:
+        env.download_dir.assert_awaited_once()
+        env.download_dir_filtered.assert_not_awaited()
+
+
+async def test_timeout_remains_typed_when_log_download_fails(tmp_path: Path):
+    paths = TrialPaths(trial_dir=tmp_path / "trial")
+    paths.mkdir()
+    env = MagicMock(spec=BaseEnvironment)
+    env.os = TaskOS.LINUX
+    env.is_path_mounted.return_value = False
+    env.download_dir.side_effect = RuntimeError("download failed")
+    env.exec.side_effect = TimeoutError("exec timed out")
+    verifier = Verifier(
+        task=Task(_create_task_dir(tmp_path)), trial_paths=paths, environment=env
+    )
+    trial = object.__new__(SingleStepTrial)
+    trial.logger = MagicMock()
+
+    with pytest.raises(VerifierTimeoutError) as error:
+        await trial._verify_with_timeout(verifier, 10)
+
+    assert isinstance(error.value.__cause__, TimeoutError)
+    env.download_dir.assert_awaited_once()
+    trial.logger.error.assert_called_once_with(
+        "Failed to download verifier logs after timeout", exc_info=True
+    )
+
+
+async def test_timeout_during_log_download_does_not_restart_it(tmp_path: Path):
+    paths = TrialPaths(trial_dir=tmp_path / "trial")
+    paths.mkdir()
+    env = MagicMock(spec=BaseEnvironment)
+    env.os = TaskOS.LINUX
+    env.is_path_mounted.return_value = False
+    env.exec.return_value = ExecResult(return_code=0)
+    cancelled = asyncio.Event()
+
+    async def download_dir(**kwargs):
+        paths.test_stdout_path.write_text("partial download\n")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    env.download_dir.side_effect = download_dir
+    verifier = Verifier(
+        task=Task(_create_task_dir(tmp_path)), trial_paths=paths, environment=env
+    )
+    trial = object.__new__(SingleStepTrial)
+    trial.logger = MagicMock()
+
+    with pytest.raises(VerifierTimeoutError):
+        await trial._verify_with_timeout(verifier, 0.01)
+
+    assert cancelled.is_set()
+    assert paths.test_stdout_path.read_text() == "partial download\n"
+    env.download_dir.assert_awaited_once()
 
 
 class TestVerifierRewardCleanup:
