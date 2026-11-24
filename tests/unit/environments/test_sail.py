@@ -1511,8 +1511,7 @@ class TestDinDStart:
         assert create["image"] is sdk.Image.devbox.return_value
         assert _compose_commands(sdk) == [
             ["build"],
-            ["up", "-d"],
-            ["exec", "-T", "main", "true"],
+            ["up", "--detach", "--wait"],
         ]
         uploaded = {
             call.args[1] for call in sdk.sailbox.fs.upload_file.aio.await_args_list
@@ -1527,6 +1526,36 @@ class TestDinDStart:
         sdk.sailbox.fs.upload_dir.aio.assert_any_await(
             env.environment_dir, "/harbor/environment"
         )
+
+    async def test_compose_wait_uses_the_build_timeout(self, temp_dir, sdk):
+        env = _make_env(temp_dir, compose=True)
+        env.task_env_config.build_timeout_sec = 73
+
+        await env.start(force_build=False)
+
+        up = next(
+            call for call in sdk.sailbox.run.aio.await_args_list if "up" in call.args[0]
+        )
+        assert up.args[0][-3:] == ["up", "--detach", "--wait"]
+        assert up.kwargs["timeout"] == 73
+
+    async def test_unhealthy_service_preserves_compose_output(self, temp_dir, sdk):
+        env = _make_env(temp_dir, compose=True)
+        _fail_when(
+            sdk,
+            lambda argv: argv[-3:] == ["up", "--detach", "--wait"],
+            exit_code=1,
+            stdout="Container main Waiting",
+            stderr="container main is unhealthy",
+        )
+
+        with pytest.raises(RuntimeError) as exc:
+            await env.start(force_build=False)
+
+        assert "docker compose up failed" in str(exc.value)
+        assert "Container main Waiting" in str(exc.value)
+        assert "container main is unhealthy" in str(exc.value)
+        sdk.sailbox.terminate.aio.assert_awaited_once()
 
     async def test_extra_compose_without_a_task_compose_file(self, temp_dir, sdk):
         extra = temp_dir / "extra.yaml"
