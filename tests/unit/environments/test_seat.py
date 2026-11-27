@@ -1,6 +1,8 @@
 """SeatEnvironment points the docker environment at one Compose service."""
 
 import shlex
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -256,6 +258,65 @@ async def test_seat_output_streams_through_its_own_callbacks(project, seat):
         await seat.exec("echo hello")
 
     assert seen == ["hello\n"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Requires POSIX sh")
+@pytest.mark.parametrize("vanishes", [True, False], ids=["vanished", "survives"])
+async def test_seat_cleanup_handles_signal_races(project, seat, temp_dir, vanishes):
+    proc = temp_dir / "proc"
+    for pid, parent, started, group in [
+        (1, 0, 1, "/../display"),
+        (9000000, 0, 2, "/"),
+        (9000001, 9000000, 3, "/"),
+        (9000002, 0, 4, "/harbor-exec-agent"),
+        (9000003, 0, 5, "/harbor-exec-agent"),
+        (9000004, 0, 6, "/../display"),
+    ]:
+        path = proc / str(pid)
+        path.mkdir(parents=True)
+        (path / "stat").write_text(
+            f"{pid} (sleep) S {parent}" + " 0" * 17 + f" {started}\n"
+        )
+        (path / "cgroup").write_text(f"0::{group}\n")
+
+    remove = "rm -r proc/9000002" if vanishes else ":"
+    prelude = f"""
+mkdir "proc/$$"
+printf '%s\\n' '0::/harbor-exec-cleanup' > "proc/$$/cgroup"
+printf '%s\\n' "$$ (sh) S 0{" 0" * 17} 7" > "proc/$$/stat"
+kill() {{
+  case "$2" in
+    9000002)
+      {remove}
+      echo 'kill: process not found or permission denied' >&2
+      return 1 ;;
+    9000003) rm -r proc/9000003 ;;
+    *) echo "Unexpected cleanup target: $2" >&2; return 1 ;;
+  esac
+}}
+"""
+
+    async def runner(command, **_):
+        assert command[:6] == ["exec", "-u", "root", "maya", "sh", "-c"]
+        result = subprocess.run(
+            ["sh", "-ec", prelude + command[-1].replace("/proc/", "proc/")],
+            cwd=temp_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return ExecResult(
+            stdout=result.stdout, stderr=result.stderr, return_code=result.returncode
+        )
+
+    project._run_docker_compose_command = AsyncMock(side_effect=runner)
+    if vanishes:
+        await seat.kill_exec_processes()
+        assert not (proc / "9000003").exists()
+    else:
+        with pytest.raises(RuntimeError, match=r"\(exit 1\): PID 9000002: kill:"):
+            await seat.kill_exec_processes()
+    assert all((proc / str(pid)).exists() for pid in (9000000, 9000001, 9000004))
 
 
 async def test_seat_refuses_start_and_stop(seat):

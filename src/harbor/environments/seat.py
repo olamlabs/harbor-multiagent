@@ -17,26 +17,78 @@ from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import TrialPaths
 
 _KILL_EXEC_PROCESSES = r"""
-ppid() { while read -r key value; do
-  if [ "$key" = PPid: ]; then echo "$value"; return 0; fi
-done < "/proc/$1/status"; return 1; }
-own=" "
+process() {
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  set -- ${stat##*) }
+  printf '%s %s %s\n' "$2" "$1" "${20}"
+}
+container_cgroup() {
+  group=$(cat "/proc/$1/cgroup" 2>/dev/null) || return 1
+  case "${group##*/}" in harbor-exec-*) group=${group%/*} ;; esac
+  printf '%s\n' "${group%/}"
+}
+if ! group=$(container_cgroup "$$"); then
+  echo "Could not read the seat's cgroup" >&2
+  exit 1
+fi
+service_pid=
+service_start=
+for dir in /proc/[0-9]*; do
+  pid=${dir#/proc/}
+  [ "$(container_cgroup "$pid")" = "$group" ] || continue
+  info=$(process "$pid") || continue
+  set -- $info
+  [ "$1" = 0 ] || continue
+  if [ -z "$service_start" ] || [ "$3" -lt "$service_start" ] ||
+      { [ "$3" -eq "$service_start" ] && [ "$pid" -lt "$service_pid" ]; }; then
+    service_pid=$pid
+    service_start=$3
+  fi
+done
+if [ -z "$service_pid" ] || [ "$service_pid" = "$$" ]; then
+  echo "Could not identify the service's initial process" >&2
+  exit 1
+fi
+own=" $service_pid "
 pid=$$
-while [ "$pid" -gt 0 ]; do own="$own$pid "; pid=$(ppid "$pid" 2>/dev/null) || break; done
+while [ "$pid" -gt 0 ]; do
+  own="$own$pid "
+  info=$(process "$pid") || break
+  pid=${info%% *}
+done
 while :; do
   targets=""
   for dir in /proc/[0-9]*; do
     target=${dir#/proc/}
+    [ "$(container_cgroup "$target")" = "$group" ] || continue
+    info=$(process "$target") || continue
+    set -- $info
+    case "$2" in Z|X) continue ;; esac
     pid=$target
     while [ "$pid" -gt 1 ]; do
       case "$own" in *" $pid "*) break ;; esac
-      parent=$(ppid "$pid" 2>/dev/null) || break
-      if [ "$parent" = 0 ]; then targets="$targets $target"; break; fi
+      parent=${info%% *}
+      if [ "$parent" = 0 ]; then targets="$targets $target:$3"; break; fi
       pid=$parent
+      info=$(process "$pid") || break
     done
   done
   [ -z "$targets" ] && exit 0
-  kill -9 $targets 2>/dev/null
+  for entry in $targets; do
+    target=${entry%:*}
+    started=${entry#*:}
+    info=$(process "$target") || continue
+    set -- $info
+    [ "$3" = "$started" ] || continue
+    case "$2" in Z|X) continue ;; esac
+    if ! error=$(kill -KILL "$target" 2>&1) && info=$(process "$target"); then
+      set -- $info
+      [ "$3" = "$started" ] || continue
+      case "$2" in Z|X) continue ;; esac
+      printf 'PID %s: %s\n' "$target" "$error" >&2
+      exit 1
+    fi
+  done
 done
 """
 
@@ -130,16 +182,17 @@ class SeatEnvironment(BaseEnvironment):
             )
 
     async def kill_exec_processes(self) -> None:
-        """Kill every process in the seat that an exec started (its parent is
-        outside the container), with its descendants, so a stopped agent stops
-        acting. The service's own processes, under PID 1, keep running."""
+        """Kill the seat's exec processes and their descendants before grading.
+        The service's initial process and its descendants stay running, even
+        if another service owns PID 1 in a shared PID namespace."""
         with self.project.scoped_output_callback(self._output_callback()):
             result = await self.project.service_exec(
                 _KILL_EXEC_PROCESSES, service=self.service, user="root"
             )
         if result.return_code != 0:
             raise RuntimeError(
-                f"Seat {self.service!r}: could not kill its agent's processes: "
+                f"Seat {self.service!r}: could not kill its agent's processes "
+                f"(exit {result.return_code}): "
                 f"{result.stdout}{result.stderr or ''}"
             )
 
